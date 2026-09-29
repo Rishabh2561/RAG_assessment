@@ -1,0 +1,59 @@
+NORTHWIND ROBOTICS - INFORMATION SECURITY POLICY
+Policy owner: Chief Information Security Officer (CISO)
+Classification: Internal
+
+1. PURPOSE
+
+This policy sets the minimum security requirements for everyone who uses Northwind
+systems, including employees, contractors and temporary staff. Violations may lead to
+disciplinary action.
+
+2. PASSWORDS AND AUTHENTICATION
+
+Passwords for Northwind accounts must be at least 14 characters long. Passphrases made
+of several unrelated words are encouraged. Passwords must not be reused across
+services and must be stored only in the company password manager (Bitwarden).
+
+Multi-factor authentication (MFA) is mandatory for email, the VPN, the source code
+repositories and all cloud consoles. Hardware security keys are required for
+administrators of production systems. SMS codes are not an accepted second factor.
+
+Passwords are not rotated on a fixed schedule. They must be changed immediately if
+there is any suspicion that they have been exposed.
+
+3. DEVICES
+
+All company laptops must use full-disk encryption (BitLocker on Windows, FileVault on
+macOS) and must lock automatically after 5 minutes of inactivity. Operating system
+security updates must be installed within 14 days of release. Critical updates flagged
+by the security team must be installed within 48 hours.
+
+Personal devices may access email and chat through the managed mobile app only. They
+may not be used to access source code, customer data or production systems.
+
+4. REMOTE ACCESS
+
+Access to internal systems from outside the office requires the corporate VPN. Public
+Wi-Fi may be used only while connected to the VPN.
+
+5. DATA HANDLING
+
+Customer data must never be copied to personal storage, personal email or unapproved
+cloud services. Data classified as Confidential must be encrypted when sent outside
+the company. Printed confidential documents must be shredded, not placed in regular
+recycling.
+
+6. REPORTING SECURITY INCIDENTS
+
+Any suspected security incident - for example a lost laptop, a phishing email that was
+clicked, or unexpected account activity - must be reported to the security team within
+1 hour of discovery, by email to security@northwind.example or by calling the 24/7
+security hotline on extension 4400. Do not try to investigate the incident yourself.
+
+Lost or stolen devices will be remotely wiped. Reporting quickly is never penalised;
+failing to report is.
+
+7. ACCESS REVIEWS
+
+Managers must review their team's access rights every quarter. Access for leavers is
+revoked on their last working day by the IT service desk.
