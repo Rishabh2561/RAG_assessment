@@ -68,3 +68,15 @@ def test_tiny_fragments_are_dropped():
 def test_invalid_overlap_rejected():
     with pytest.raises(ValueError):
         RecursiveChunker(100, 100)
+
+
+@pytest.mark.parametrize("size,overlap", [(200, 40), (700, 140), (1000, 0)])
+def test_no_text_is_lost(size, overlap):
+    """Every word of the input appears in some chunk (regression: short trailing lines)."""
+    text = ("Policy paragraph with enough words to fill space. " * 13).strip()
+    text += "\n\nRefund: 14 days.\n\nContact: help@example.com"
+    chunks = RecursiveChunker(size, overlap, min_chars=20).split_text(text)
+    joined = " ".join(chunks)
+    for word in set(text.split()):
+        assert word in joined, word
+    assert all(len(c) <= size + 60 for c in chunks)  # small overflow from absorbed tails

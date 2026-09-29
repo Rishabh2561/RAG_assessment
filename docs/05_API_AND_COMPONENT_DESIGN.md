@@ -1,0 +1,175 @@
+# 05 — API and Component Design
+
+## 1. Package layout and dependency direction
+
+```
+src/rag_generator/
+├── config/          Settings (pydantic-settings). Reads the environment; nothing else does.
+├── models/          Pydantic data models shared by every layer (no logic, no I/O).
+├── errors.py        Error hierarchy rooted at RAGError.
+├── observability/   JSON/text logging, content redaction, StageTimer.
+├── textproc.py      Tokeniser shared by BM25 and the hashing embedder.
+├── ingestion/       DocumentParser protocol, PdfParser/TextParser/DocxParser, ParserRegistry.
+├── chunking/        RecursiveChunker.
+├── embeddings/      EmbeddingProvider protocol, FastEmbedProvider, HashingEmbeddingProvider.
+├── storage/         VectorStore protocol, NumpyVectorStore, DocumentCatalog, Collection(+Repository).
+├── retrieval/       Retriever protocol, BM25Index, Dense/BM25/Hybrid retrievers, RRF.
+├── reranking/       Reranker protocol, NoOpReranker, CrossEncoderReranker.
+├── generation/      LLMProvider protocol, prompts + schemas, citation validation, AnthropicProvider.
+├── orchestration/   IngestionService, QueryService, factory (composition root), RAGApplication.
+├── evaluation/      Dataset schema, pure metrics, EvaluationRunner.
+└── interfaces/      cli.py (typer), api.py (FastAPI): thin adapters.
+```
+
+Dependencies point downwards only:
+
+```mermaid
+flowchart TD
+    interfaces --> orchestration
+    evaluation --> orchestration
+    orchestration --> ingestion & chunking & embeddings & storage & retrieval & reranking & generation
+    retrieval --> storage & embeddings
+    ingestion & chunking & embeddings & storage & retrieval & reranking & generation --> models
+    models ~~~ config
+    orchestration --> config
+```
+
+**Vendor boundary.** `anthropic` is imported only in
+`generation/anthropic_provider.py`. `fastembed` is imported only inside
+`FastEmbedProvider._load` and `CrossEncoderReranker._load`, lazily, so importing the
+package never loads a model. `pymupdf` and `docx` are imported only inside their
+parser methods. The factory is the single place that maps configuration to concrete
+classes.
+
+## 2. Interfaces (protocols)
+
+All interfaces are `typing.Protocol`s (structural typing), so an implementation needs
+no base class. Tests use plain fakes that satisfy the same shape.
+
+| Protocol | Methods | Implementations | Contract |
+|----------|---------|-----------------|----------|
+| `DocumentParser` | `extensions: tuple[str, ...]`, `parse(data: bytes, source: str) -> ParsedDocument` | `PdfParser`, `TextParser`, `DocxParser` | Never returns a document with no text. Raises an `IngestionError` subclass for unusable input. |
+| `EmbeddingProvider` | `model_id`, `embed_documents(list[str]) -> ndarray[n, d]`, `embed_query(str) -> ndarray[d]` | `FastEmbedProvider`, `HashingEmbeddingProvider` | Vectors are L2-normalised `float32`. `model_id` uniquely identifies the vector space. |
+| `VectorStore` | `version`, `model_id`, `__len__`, `add`, `delete_document`, `drop_orphans`, `search(vec, k) -> [(Chunk, score)]`, `all_chunks`, `persist` | `NumpyVectorStore` | `search` returns cosine-descending results. The store refuses vectors or queries from a different `model_id` (`IndexMismatchError`). `version` increases on every mutation. |
+| `Retriever` | `name`, `retrieve(query, k) -> RetrievalResult` | `DenseRetriever`, `BM25Retriever`, `HybridRetriever` | `RetrievalResult.best_dense_score` is `None` when the mode has no dense component. |
+| `Reranker` | `name`, `rerank(query, candidates, k) -> list[RetrievedChunk]` | `NoOpReranker`, `CrossEncoderReranker` | Returns at most `k` items, highest first. |
+| `LLMProvider` | `model_id`, `generate_json(system, user, schema) -> LLMResponse` | `AnthropicProvider` (tests: `FakeLLM`) | Returns a JSON object matching `schema`, or raises `GenerationError(retryable=…)`. Knows nothing about RAG. |
+
+### Adding a new implementation (examples)
+
+| Change | Work required |
+|--------|---------------|
+| pgvector store | Class `PgVectorStore` implementing `VectorStore`, plus one branch in `factory.build_repository`, plus `"pgvector"` in `Settings.vector_store`. |
+| OpenAI / Voyage embeddings | Class implementing `EmbeddingProvider`, plus one branch in `factory.build_embedder`. Existing collections will raise `IndexMismatchError` until they are re-ingested. |
+| Different LLM vendor or local model | Class implementing `LLMProvider.generate_json`, plus one branch in `factory.build_llm`. Prompts, schema and citation logic are reused unchanged. |
+| HTML parser | Class with `extensions = ("html",)`, registered in `ParserRegistry`. |
+
+## 3. Services
+
+### `IngestionService` (write path)
+
+```python
+ingest_paths(paths: Iterable[Path], collection: str) -> IngestReport
+ingest_bytes(files: list[tuple[str, bytes]], collection: str) -> IngestReport
+delete_document(collection: str, doc_id: str) -> DocumentRecord | None
+```
+
+- The service holds the collection's write lock for the whole batch, and persists once
+  at the end if anything changed.
+- `doc_id` is the first 16 hex characters of SHA-256(bytes). Identical content is
+  skipped. Different content under an existing `source` name replaces it.
+- Per-file failures become `IngestResult(status="failed", error_type, message)`. They
+  never raise out of the batch.
+
+### `QueryService` (read path)
+
+```python
+ask(question: str) -> Answer
+```
+
+The service is constructed per request by `RAGApplication.query(collection, mode=,
+top_k=, use_llm=)`. It takes a `QueryOptions` dataclass (top_k, candidate_pool,
+min_relevance, max_context_chars, max_question_chars, query_rewrite, max_rewrites,
+rrf_k), not the whole `Settings`, so tests can construct it directly.
+
+### `RAGApplication` (composition root)
+
+This object is long-lived and holds the components that are expensive to create:
+the embedding model, reranker, LLM client, collection repository, parser registry and
+chunker. The CLI creates one per command. The API creates one per process and shares
+it across requests.
+
+## 4. Data models (`models/`)
+
+| Model | Key fields | Notes |
+|-------|------------|-------|
+| `Section` | `text`, `page: int \| None` | One PDF page, or the whole text of a pageless format. |
+| `ParsedDocument` | `source`, `file_type`, `sections`, `warnings` | Parser output. |
+| `Chunk` | `chunk_id`, `doc_id`, `source`, `page`, `index`, `text` | `chunk_id = f"{doc_id[:12]}-{index:05d}"` (deterministic). |
+| `DocumentRecord` | `doc_id`, `source`, `file_type`, `content_hash`, `size_bytes`, `num_chunks`, `num_pages`, `ingested_at` | Catalog entry. |
+| `IngestResult` / `IngestReport` | `status ∈ {ingested, replaced, skipped_duplicate, failed}`, `error_type`, `message`, `warnings` | Per-file outcome. |
+| `RetrievedChunk` | `chunk`, `score`, `dense_score`, `lexical_score`, `rerank_score` | Component scores are kept for tracing. |
+| `Citation` | `source_id` (`S1`…), `chunk_id`, `doc_id`, `source`, `page`, `snippet` | Resolved from validated IDs. |
+| `QueryTrace` | mode, reranker, model, attempts, rewritten queries, retrieved chunk IDs, best dense score, gate threshold, invalid citations, tokens, stage timings | Contains **no document text**. |
+| `Answer` | `answer`, `answerable`, `grounding_status ∈ {grounded, unverified, abstained, retrieval_only}`, `citations`, `reason`, `passages`, `trace` | API and CLI response. |
+
+## 5. Configuration model
+
+`Settings` (`config/settings.py`) is a flat pydantic model. Each field's env var is
+`RAG_<FIELD_NAME>`, except `ANTHROPIC_API_KEY`. The full list with defaults and
+comments is in [`.env.example`](../.env.example). The groups are:
+
+- **Storage:** `data_dir`, `default_collection`, `max_file_mb`, `max_upload_files`.
+- **Chunking:** `chunk_size`, `chunk_overlap`, `min_chunk_chars`.
+- **Embeddings:** `embedding_provider`, `embedding_model`, `embedding_batch_size`,
+  `hashing_dimensions`, `model_cache_dir`.
+- **Retrieval:** `retrieval_mode`, `top_k`, `candidate_pool`, `rrf_k`, `min_relevance`.
+- **Reranking:** `reranker`, `reranker_model`.
+- **Generation:** `llm_provider`, `llm_model`, `llm_effort`, `llm_max_tokens`,
+  `llm_timeout_s`, `llm_max_retries`, `llm_temperature`, `anthropic_server_fallback`,
+  `max_context_chars`, `max_question_chars`.
+- **Agentic:** `query_rewrite`, `max_rewrites`.
+- **Observability:** `log_level`, `log_format`, `log_content`.
+
+Validation: enum-like fields are `Literal`s, and numeric fields have bounds. Two
+cross-field rules exist: `chunk_overlap < chunk_size` and `top_k <= candidate_pool`.
+The collection name pattern `^[A-Za-z0-9_-]{1,64}$` also prevents path traversal.
+
+## 6. REST API
+
+The API runs with `rag serve`. Interactive documentation is at `http://127.0.0.1:8000/docs`.
+
+| Method & path | Body | Response | Errors |
+|---------------|------|----------|--------|
+| `GET /health` | — | status, versions, models, mode | — |
+| `GET /collections` | — | `list[str]` | — |
+| `POST /collections/{c}/documents` | multipart `files[]` | `IngestReport` (per-file statuses) | 400 invalid collection name · 413 more than `RAG_MAX_UPLOAD_FILES` files |
+| `GET /collections/{c}/documents` | — | `list[DocumentRecord]` | 404 |
+| `DELETE /collections/{c}/documents/{doc_id}` | — | `DocumentRecord` | 404 |
+| `DELETE /collections/{c}` | — | 204 | 404 |
+| `POST /collections/{c}/query` | `{question, top_k?, mode?, retrieval_only?, include_passages?}` | `Answer` | 400 invalid question · 404 no collection · 409 empty collection or index mismatch · 422 schema · 503 LLM failure (`retryable` flag) |
+
+Error bodies have the shape `{"error": "<ErrorClass>", "detail": "<message>"}`. The
+mapping lives in one table (`interfaces/api.py::_STATUS_BY_ERROR`).
+
+Example:
+
+```bash
+curl -F "files=@handbook.pdf" -F "files=@policy.docx" localhost:8000/collections/hr/documents
+curl -X POST localhost:8000/collections/hr/query -H 'content-type: application/json' \
+     -d '{"question": "How many days of annual leave do I get?"}'
+```
+
+## 7. CLI
+
+| Command | Purpose |
+|---------|---------|
+| `rag ingest PATH... [-c NAME]` | Ingest files and directories (recursive, supported types only). |
+| `rag ask "QUESTION" [-c NAME] [--mode] [-k N] [--no-llm] [--rewrite] [--trace] [--json]` | Ask a question. |
+| `rag docs [-c NAME]` / `rag collections` | List documents or collections. |
+| `rag delete DOC_ID [-c NAME]` / `rag drop [-c NAME] [--yes]` | Remove a document or a whole collection. |
+| `rag eval DATASET [-c NAME] [--modes dense,bm25,hybrid] [--rerankers none,cross_encoder] [--answers] [--judge]` | Evaluate. Writes a JSON report to `eval_reports/`. |
+| `rag serve [--host] [--port]` | Start the REST API. |
+
+Exit codes: `0` for success, `1` for an application error (the message goes to
+stderr), and `2` for invalid configuration.

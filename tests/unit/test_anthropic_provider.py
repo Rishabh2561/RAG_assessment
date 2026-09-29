@@ -135,3 +135,14 @@ def test_sdk_errors_map_to_generation_error(exc, retryable, match):
     with pytest.raises(GenerationError, match=match) as info:
         provider.generate_json("s", "u", {})
     assert info.value.retryable is retryable
+
+
+def test_missing_credentials_give_actionable_error(monkeypatch, tmp_path):
+    """Uses the real SDK client: with no key it raises a bare TypeError, which must be mapped."""
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))  # no saved profiles
+    provider = AnthropicProvider("claude-opus-5-5", max_retries=0, timeout_s=2)
+    with pytest.raises(GenerationError, match="ANTHROPIC_API_KEY") as info:
+        provider.generate_json("s", "u", {})
+    assert info.value.retryable is False

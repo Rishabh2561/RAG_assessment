@@ -43,11 +43,11 @@ Rating scale: **L** = low, **M** = medium, **H** = high. For *Cost*, *Latency* a
 | | FAISS | Scales to 10⁷+ (ANN) | Separate metadata store; native dependency; delete semantics vary | L | L | M | H | |
 | | Chroma | Metadata + persistence built in | Heavier dependency; overlapping abstractions | L | L | M | M | |
 | | pgvector | Transactions, ACLs, SQL joins, concurrency | Requires a Postgres service | M | L | H | H | |
-| **Retrieval** | Dense only | Handles paraphrase | Misses exact codes and names with a small model | L | L | L | H | |
+| **Retrieval** | Dense only | Handles paraphrase; best measured on sample corpus | Can miss exact codes in large identifier-heavy corpora | L | L | L | H | ✅ (revised, D8) |
 | | BM25 only | Exact terms; no model | Fails on paraphrase and synonyms | L | L | L | H | |
-| | Hybrid (RRF) | Robust across both query types; parameter-light | Extra scoring pass; some complexity | L | L | M | H | ✅ |
-| **Reranking** | None | Zero latency and dependencies | No fix when ranking is the bottleneck | L | L | L | H | ✅ default |
-| | Cross-encoder (MiniLM, local) | Better precision at the top ranks | +50–300 ms CPU; another model | L | M | M | M | available |
+| | Hybrid (RRF) | Robust to identifier-heavy queries; parameter-light | Equal-weight RRF demoted a dense-only hit (measured); extra pass | L | L | M | H | available |
+| **Reranking** | None | Zero latency and dependencies; hit@5 already 1.0 (measured) | No fix when ranking is the bottleneck | L | L | L | H | ✅ default |
+| | Cross-encoder (MiniLM, local) | hit@1 0.81 → 1.00 at chunk size 1000 (measured) | ~1.5 s p50 on CPU for 20 candidates (measured); another model | L | H | M | M | available |
 | | LLM or hosted rerank API | Highest quality | Per-query cost; another vendor | H | H | M | H | |
 | **LLM** | Claude (hosted, `claude-opus-5-5`, effort low) | Strong grounding and abstention adherence; structured output | Per-query cost; passages sent to the API | M | M | L | H | ✅ |
 | | Cheaper hosted tier (Sonnet 5.5 / Haiku 4.5) | Lower cost and latency | Somewhat weaker instruction adherence | L | L | L | H | config option |
@@ -110,20 +110,27 @@ milliseconds.
 metadata or several app replicas → pgvector. Millions of vectors on one node → FAISS
 (HNSW/IVF). Rich metadata filtering without running Postgres → Chroma or Qdrant.
 
-### Retrieval — hybrid RRF
+### Retrieval — dense (revised from hybrid)
 
-**Why here:** An unknown corpus means unknown query types. Hybrid is the
-"no-regrets" default that stays robust to both paraphrase and exact-identifier
-queries, and RRF needs no per-corpus weight tuning. The mode is configurable, and
-evaluation reports all three.
-**When I'd choose the alternative:** Latency-critical systems at huge scale where the
-BM25 index is expensive → dense only, with a stronger model. Code search or log
-search dominated by identifiers → BM25-heavy.
+**Why here:** The design-time choice was hybrid, reasoning that unknown corpora mean
+unknown query types. Measurement overturned it (D8). On the sample corpus, dense
+matched or beat hybrid in every question category. Even the exact-identifier
+questions ("E-221") were solved by the dense model. Hybrid lost a paraphrase
+question, because the unstemmed BM25 missed it and equal-weight RRF then promoted
+chunks both retrievers found above the correct dense-only hit. With no measured
+benefit, the simpler pipeline wins. This is a directional result on 21 answerable
+questions, not proof.
+**When I'd choose the alternative:** Corpora with many near-identical identifiers
+(part catalogues, ticket or log search, statute references), where a small embedding
+model can't tell "E-221" from "E-212". There, use `hybrid`, ideally with stemming
+and weighted fusion, and confirm with `rag eval`.
 
 ### Reranking — off by default
 
 **Why here:** Adding it without evidence is exactly the "sophistication for its own
-sake" we want to avoid. It is implemented so the hypothesis is testable with one flag.
+sake" we want to avoid. It is implemented so the hypothesis is testable with one flag,
+and it *was* tested (D11). It improved hit@1 only at chunk size 1000, never hit@5,
+and it costs about 1.5 s per query on CPU.
 **When I'd choose the alternative:** Evaluation shows high recall@20 but low MRR or
 hit@3, meaning the right chunk is retrieved but ranked too low. Then the cross-encoder
 is the targeted fix.

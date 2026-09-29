@@ -77,6 +77,11 @@ def create_app(rag: RAGApplication) -> FastAPI:
     async def upload_documents(
         collection: str, files: Annotated[list[UploadFile], File(description="Documents")]
     ) -> IngestReport:
+        if len(files) > rag.settings.max_upload_files:
+            raise HTTPException(
+                status_code=413,
+                detail=f"at most {rag.settings.max_upload_files} files per request",
+            )
         payloads: list[tuple[str, bytes]] = []
         oversized: list[IngestResult] = []
         for upload in files:

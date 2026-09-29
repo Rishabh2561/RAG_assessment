@@ -53,7 +53,23 @@ class RecursiveChunker:
         if not text:
             return []
         pieces = self._split_recursive(text, 0)
-        return self._merge(pieces)
+        return self._absorb_small(self._merge(pieces))
+
+    def _absorb_small(self, chunks: list[str]) -> list[str]:
+        """Append chunks shorter than ``min_chars`` to their predecessor.
+
+        A short trailing line ("Contact: x@y.com") can end up alone when the previous
+        chunk leaves no overlap; dropping it would lose text, so it is kept with the
+        preceding chunk (a small overflow of ``chunk_size`` is accepted). Only a section
+        whose *entire* text is shorter than ``min_chars`` is dropped, in ``chunk``.
+        """
+        result: list[str] = []
+        for chunk in chunks:
+            if result and len(chunk) < self.min_chars:
+                result[-1] = f"{result[-1]}\n{chunk}"
+            else:
+                result.append(chunk)
+        return result
 
     def _split_recursive(self, text: str, level: int) -> list[str]:
         if len(text) <= self.chunk_size:

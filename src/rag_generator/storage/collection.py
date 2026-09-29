@@ -29,6 +29,7 @@ class Collection:
         self.store = store
         self.catalog = catalog
         self.lock = threading.RLock()
+        self.closed = False
         self._derived: dict[str, tuple[int, Any]] = {}
 
     def derived(self, key: str, build: Callable[[], Any]) -> Any:
@@ -36,13 +37,18 @@ class Collection:
         cached = self._derived.get(key)
         if cached is not None and cached[0] == self.store.version:
             return cached[1]
+        # Capture the version *before* building: if a writer mutates the store while we
+        # build, the cached value is tagged with the older version and rebuilt next time.
+        version = self.store.version
         value = build()
-        self._derived[key] = (self.store.version, value)
+        self._derived[key] = (version, value)
         return value
 
     def persist(self) -> None:
-        # Index first, catalog second: a crash in between leaves orphan chunks, which
-        # are dropped on next open (see CollectionRepository.open).
+        # Index first, catalog second. A crash in between leaves the two out of step;
+        # CollectionRepository.open reconciles both directions on the next start.
+        if self.closed:
+            raise CollectionNotFoundError(f"collection '{self.name}' was dropped")
         self.store.persist()
         self.catalog.persist()
 
@@ -68,8 +74,7 @@ class CollectionRepository:
                 )
             catalog = DocumentCatalog(directory)
             store = self.store_factory(directory)
-            if removed := store.drop_orphans(catalog.doc_ids()):
-                log_event(logger, "orphan_chunks_dropped", collection=name, chunks=removed)
+            _reconcile(name, store, catalog)
             collection = Collection(name, directory, store, catalog)
             self._open[name] = collection
             return collection
@@ -85,9 +90,31 @@ class CollectionRepository:
         if not directory.exists():
             raise CollectionNotFoundError(f"collection '{name}' does not exist")
         with self._lock:
-            self._open.pop(name, None)
-            shutil.rmtree(directory)
+            collection = self._open.pop(name, None)
+            if collection is None:
+                shutil.rmtree(directory)
+            else:
+                with collection.lock:  # wait for in-flight writes, then refuse new ones
+                    collection.closed = True
+                    shutil.rmtree(directory)
         log_event(logger, "collection_dropped", collection=name)
+
+
+def _reconcile(name: str, store: VectorStore, catalog: DocumentCatalog) -> None:
+    """Repair a collection left inconsistent by a crash between the two writes.
+
+    Chunks without a catalog entry (crash during add) are dropped; catalog entries
+    without chunks (crash during delete/replace) are removed so the file can be
+    re-ingested instead of being reported as a duplicate forever.
+    """
+    if removed := store.drop_orphans(catalog.doc_ids()):
+        log_event(logger, "orphan_chunks_dropped", collection=name, chunks=removed)
+    indexed = {c.doc_id for c in store.all_chunks()}
+    ghosts = [doc_id for doc_id in catalog.doc_ids() if doc_id not in indexed]
+    for doc_id in ghosts:
+        catalog.remove(doc_id)
+    if ghosts:
+        log_event(logger, "ghost_catalog_entries_dropped", collection=name, documents=len(ghosts))
 
 
 def validate_collection_name(name: str) -> None:

@@ -124,18 +124,41 @@ class QueryService:
                 generation = self._generate(question, result.chunks, trace)
 
         if self._insufficient(generation) and self.options.query_rewrite:
-            with timer.stage("rewrite"):
-                queries = self._rewrite(question, trace)
-            with timer.stage("retrieve_rewritten"):
-                result = self._retrieve_many([question, *queries])
-            self._record_retrieval(trace, result)
-            if not self._gate_fails(result):
-                with timer.stage("generate_retry"):
-                    generation = self._generate(question, result.chunks, trace)
+            result, generation = self._corrective_retry(question, result, generation, trace, timer)
 
         if generation is None:
             return self._abstain(question, result, trace, reason=self._gate_reason(result))
         return self._build_answer(question, result, generation, trace)
+
+    def _corrective_retry(
+        self,
+        question: str,
+        result: RetrievalResult,
+        generation: _Generation | None,
+        trace: QueryTrace,
+        timer: StageTimer,
+    ) -> tuple[RetrievalResult, _Generation | None]:
+        """One bounded rewrite-and-retry (ADR-009).
+
+        The retry is optional: if it fails (rate limit, timeout), the first-round
+        outcome (an abstention) is returned instead of turning it into an error.
+        """
+        try:
+            with timer.stage("rewrite"):
+                queries = self._rewrite(question, trace)
+            if not queries:
+                return result, generation
+            with timer.stage("retrieve_rewritten"):
+                retry_result = self._retrieve_many([question, *queries])
+            self._record_retrieval(trace, retry_result)
+            if self._gate_fails(retry_result):
+                return retry_result, None
+            with timer.stage("generate_retry"):
+                return retry_result, self._generate(question, retry_result.chunks, trace)
+        except GenerationError as exc:
+            trace.rewrite_error = str(exc)
+            log_event(logger, "rewrite_failed", level=logging.WARNING, error=str(exc))
+            return result, generation
 
     def _retrieve(self, query: str) -> RetrievalResult:
         use_reranker = self.reranker.name != "none"
@@ -170,7 +193,12 @@ class QueryService:
         try:
             payload = _AnswerPayload.model_validate(response.data)
         except ValidationError as exc:
-            raise GenerationError(f"model output did not match the answer schema: {exc}") from exc
+            # Report field locations only: the error text would otherwise embed the
+            # model's output (which may quote documents) into logs.
+            fields = sorted({".".join(map(str, e["loc"])) for e in exc.errors()})
+            raise GenerationError(
+                f"model output did not match the answer schema (fields: {fields})"
+            ) from exc
         return _Generation(payload=payload, source_map=source_map)
 
     def _rewrite(self, question: str, trace: QueryTrace) -> list[str]:

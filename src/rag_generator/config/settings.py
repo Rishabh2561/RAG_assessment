@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path(".rag_data")
     default_collection: str = Field("default", pattern=r"^[A-Za-z0-9_-]{1,64}$")
     max_file_mb: float = Field(50, gt=0)
+    max_upload_files: int = Field(20, ge=1, le=1000)
 
     # Chunking
     chunk_size: int = Field(700, ge=100, le=8000)

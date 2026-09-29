@@ -75,13 +75,13 @@ flowchart LR
 |-----------|----------------|------------------------|---------------|
 | `Settings` | Single typed source of configuration: env vars with the `RAG_` prefix plus an optional `.env`. Validated at start-up. | `pydantic-settings` | — |
 | `ParserRegistry` / `DocumentParser` | Map a file extension to a parser. Produce a `ParsedDocument` made of ordered `Section`s, each with an optional page number. Detect empty, corrupt and scanned files. | `PdfParser` (PyMuPDF), `TextParser`, `DocxParser` | Register another parser |
-| `RecursiveChunker` | Split each section into overlapping chunks, preferring paragraph → line → sentence → word boundaries. Chunks never cross page boundaries, so page citations stay exact. | Size and overlap in characters | `RAG_CHUNK_SIZE`, `RAG_CHUNK_OVERLAP` |
+| `RecursiveChunker` | Split each section into overlapping chunks, preferring paragraph → line → sentence → word boundaries. Chunks never cross page boundaries, so page citations stay exact. | 700 characters, 140 overlap | `RAG_CHUNK_SIZE`, `RAG_CHUNK_OVERLAP` |
 | `EmbeddingProvider` | Text → L2-normalised vectors. Separate `embed_documents` and `embed_query` methods (some models use different prefixes). | `FastEmbedProvider` (`BAAI/bge-small-en-v1.5`, local ONNX) | `RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL` |
 | `VectorStore` | Persist chunks and vectors per collection; exact cosine search; delete by document. Records the embedding model and dimension, and refuses mismatched queries. | `NumpyVectorStore` (`.npy` + `.jsonl`) | `RAG_VECTOR_STORE` |
 | `DocumentCatalog` | Per-collection registry of documents: ID, file name, content hash, chunk count, ingestion time. Drives idempotent re-ingestion and listing. | JSON file | — |
-| `Retriever` | Question → ranked `RetrievedChunk`s. | `HybridRetriever` (dense + BM25 fused with reciprocal-rank fusion) | `RAG_RETRIEVAL_MODE` = `dense` \| `bm25` \| `hybrid` |
+| `Retriever` | Question → ranked `RetrievedChunk`s. | `DenseRetriever` (chosen by evaluation, D8). `BM25Retriever` and `HybridRetriever` (reciprocal-rank fusion) are also available | `RAG_RETRIEVAL_MODE` = `dense` \| `bm25` \| `hybrid` |
 | `Reranker` | Re-score the top-N candidates and keep the top-k. | `NoOpReranker` | `RAG_RERANKER` = `none` \| `cross_encoder` |
-| Relevance gate | Abstain *before* calling the LLM when the best dense similarity is below a threshold. | Threshold from settings | `RAG_MIN_RELEVANCE` |
+| Relevance gate | Abstain *before* calling the LLM when the best dense similarity is below a threshold. This only catches off-topic questions (D9). | 0.50 for bge-small | `RAG_MIN_RELEVANCE` |
 | Prompt builder | Render retrieved chunks as numbered sources `[S1]…[Sn]` with file and page, inside a context budget. Documents are delimited as untrusted data. | — | `RAG_MAX_CONTEXT_CHARS` |
 | `LLMProvider` | (system, user, schema) → structured JSON plus usage. | `AnthropicProvider` (Claude) | `RAG_LLM_PROVIDER` = `anthropic` \| `none` |
 | Citation validator | Keep only citations whose IDs were actually supplied as context; derive `grounding_status`. | — | — |
@@ -128,11 +128,17 @@ Key properties:
 - **Document identity = content hash.** Re-uploading identical bytes (even under a
   different name) is a no-op. Uploading different bytes under an existing file name
   replaces the previous version, so the index never holds two versions of the same
-  file.
+  file. The new version is added *before* the old one is removed, so a failed replace
+  (for example an embedding-model mismatch) leaves the old version intact.
+- **Source names** are paths relative to the common parent of the ingested inputs:
+  `rag ingest a b` yields `a/notes.md` and `b/notes.md`, not two colliding
+  `notes.md`s. Two files with the same name in one upload batch are rejected
+  (`DuplicateSourceError`).
 - **Deterministic chunk IDs** (`{doc_id[:12]}-{index:05d}`), so citations, logs and
   evaluation labels stay stable across runs.
 - **Per-file isolation.** A corrupt file yields `status=failed` with a reason, and the
-  rest of the batch continues.
+  rest of the batch continues. Unexpected library exceptions are caught per file too.
+- **Persist only if something changed** (the store's version moved).
 - **Persist once per batch**, after all files, using an atomic write-and-rename
   (§7).
 
@@ -144,38 +150,46 @@ flowchart TD
     V -- no --> E1[400 / ValidationError]
     V -- yes --> R[Retrieve top-N candidates<br/>dense / bm25 / hybrid]
     R --> RR[Rerank → top-k<br/>no-op by default]
-    RR --> G{best dense score<br/>≥ min_relevance?}
-    G -- no --> AB1[Abstain: 'not found in documents'<br/>no LLM call]
-    G -- yes --> L{LLM configured?}
-    L -- no --> RO[Retrieval-only result:<br/>ranked passages, no generated answer]
-    L -- yes --> P[Build prompt: numbered sources S1..Sk]
+    RR --> L{LLM configured?}
+    L -- no --> RO[Retrieval-only result: ranked passages,<br/>status abstained if the gate fails]
+    L -- yes --> G{best dense score<br/>≥ min_relevance?}
+    G -- no --> RW
+    G -- yes --> P[Build prompt: numbered sources S1..Sk]
     P --> GEN[LLM → answerable, answer, cited ids]
     GEN --> CV[Validate citations against supplied ids]
     CV --> A{answerable?}
     A -- yes --> OUT[Answer + citations + trace]
     A -- no --> RW{rewrite enabled<br/>and not yet retried?}
-    RW -- no --> AB2[Abstain with LLM's reason]
-    RW -- yes --> QR[LLM rewrites query] --> R2[Retrieve again,<br/>merge with first results] --> P
+    RW -- no --> AB2[Abstain: 'not found in documents'<br/>with the gate's or the LLM's reason]
+    RW -- yes --> QR[LLM rewrites query] --> R2[Retrieve original + rewrites,<br/>fuse with RRF] --> G
 ```
 
+Both "insufficient context" signals lead into the same branch: the relevance gate
+failing, or the LLM returning `answerable=false`. With rewriting off (the default), the
+branch abstains. If the gate fails, no LLM call is made at all.
+
 The corrective branch (`RAG_QUERY_REWRITE=true`) is the only agentic behaviour in
-the system. It is bounded to **one** retry and is off by default. The rationale is in
-ADR-009.
+the system. It is bounded to **one** retry: after the rewrite, a failed gate or a
+second `answerable=false` abstains. The retry is optional work, so if the rewrite
+call itself fails (rate limit, timeout) the first-round abstention is returned and
+the error is recorded in `trace.rewrite_error`. An empty rewrite skips the retry. The gate triggers the rewrite too, because
+vocabulary mismatch often shows up as low similarity. The rationale is in ADR-009.
 
 ## 5. Runtime document lifecycle
 
 | Stage | Trigger | Effect |
 |-------|---------|--------|
-| Upload / ingest | `rag ingest <paths> -c <collection>` or `POST /collections/{c}/documents` | File is parsed, chunked, embedded and persisted. Uploaded bytes go to a temporary file, which is deleted once parsing finishes (§09). |
+| Upload / ingest | `rag ingest <paths> -c <collection>` or `POST /collections/{c}/documents` | File is parsed from memory (parsers take bytes, D7), then chunked, embedded and persisted. The application writes no temporary files; note that the web framework (Starlette) spools multipart parts larger than 1 MB to its own temporary files while receiving them. |
 | Re-ingest same content | Same commands | Skipped (`skipped_duplicate`). |
 | Re-ingest changed file with the same name | Same commands | Old chunks for that file name are removed, and the new version is indexed. |
 | List | `rag docs -c <c>` / `GET /collections/{c}/documents` | Reads the catalog. |
 | Delete | `rag delete <doc_id> -c <c>` / `DELETE /collections/{c}/documents/{doc_id}` | Removes the document's chunks and vectors and its catalog entry. |
-| Drop collection | `rag drop -c <c>` / `DELETE /collections/{c}` | Removes the collection directory. |
+| Drop collection | `rag drop -c <c>` / `DELETE /collections/{c}` | Waits for in-flight writes, marks the handle closed (later writes are refused), then removes the directory. |
 | Query | `rag ask` / `POST /collections/{c}/query` | Read-only against the current snapshot. |
 
-A collection is created lazily on first ingest. Querying an empty or missing
-collection returns a clear `CollectionEmpty` error rather than an empty answer.
+A collection is created lazily on first ingest. Querying a missing collection
+returns `CollectionNotFoundError` (HTTP 404), and querying an empty one returns
+`CollectionEmptyError` (HTTP 409), rather than an empty answer.
 
 ## 6. Configuration flow
 
@@ -205,16 +219,20 @@ concrete vendor classes. Everything else depends on the protocols in each packag
 ${RAG_DATA_DIR}/                 (default ./.rag_data)
 └── collections/
     └── <collection>/
-        ├── manifest.json        embedding model, dimension, schema version, counts
-        ├── chunks.jsonl         one Chunk per line (text + metadata)
-        ├── vectors.npy          float32 [n_chunks, dim], row-aligned with chunks.jsonl
+        ├── index.npz            one file: vectors float32 [n, dim] + chunks (JSON) + manifest
+        │                        (embedding model id, dimension, schema version)
         └── documents.json       DocumentCatalog
 ```
 
-Writes go to `*.tmp` and are then renamed with `os.replace`, which is atomic on the
-same filesystem, so a crash mid-write leaves the previous consistent snapshot in
-place. The BM25 index is **derived** state: it is rebuilt in memory from
-`chunks.jsonl` when a collection loads, and never persisted.
+Vectors and chunks live in **one** file so they can never be written out of step.
+Each file is written to a temporary name, then renamed with `os.replace`, which is
+atomic on the same filesystem. The index is written before the catalog, so a crash
+between the two can leave them out of step in either direction. On open, the
+collection is reconciled both ways: chunks with no catalog entry (crash during an
+add) are dropped, and catalog entries with no chunks (crash during a delete or
+replace) are removed. Either way, re-ingesting the file restores it.
+The BM25 index is **derived** state: it is rebuilt in memory from the stored chunks
+whenever the store's version changes, and never persisted.
 
 ## 8. Failure paths (summary)
 

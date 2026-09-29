@@ -102,3 +102,9 @@ def test_llm_outage_returns_503_with_retryable_flag(client_for):
 def test_health(client_for):
     body = client_for().get("/health").json()
     assert body["status"] == "ok" and body["llm_model"] is None
+
+
+def test_too_many_files_in_one_request(client_for):
+    client = client_for(max_upload_files=2)
+    files = [(f"f{i}.txt", b"Some small file content here.") for i in range(3)]
+    assert _upload(client, "c", files).status_code == 413

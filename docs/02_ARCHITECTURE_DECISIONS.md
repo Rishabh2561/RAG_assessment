@@ -62,8 +62,8 @@ work on any document set without tuning per corpus.
 
 **Decision.** A self-implemented `RecursiveChunker`:
 
-- Target size of **1,000 characters** with **150 characters of overlap**, both
-  configurable.
+- Target size of **700 characters** with **140 characters of overlap**, both
+  configurable. The initial 1,000 / 150 was revised by measurement (DECISION_LOG D10).
 - Split first on blank lines, then newlines, then sentence ends, then spaces, then
   characters, and greedily merge the pieces back up to the target size.
 - Chunk **within** a section (a page, for PDFs), never across one, so every chunk
@@ -84,7 +84,7 @@ work on any document set without tuning per corpus.
   a large framework for about 60 lines of logic.
 
 **Trade-offs.** Characters are a proxy for tokens (about 4 characters per token for
-English, so 1,000 characters is roughly 250 tokens, well inside bge-small's 512-token
+English, so 700 characters is roughly 175 tokens, well inside bge-small's 512-token
 window). We accept imprecision on non-English text for zero tokenizer dependency.
 Page-bounded chunks can make a chunk small when a paragraph spans a page break; we
 accept that for exact page citations.
@@ -170,18 +170,26 @@ implementation is a single new class plus a factory entry.
 
 ---
 
-## ADR-005 — Retrieval: hybrid (dense + BM25, reciprocal-rank fusion), mode configurable
+## ADR-005 — Retrieval: dense by default; BM25 and hybrid (RRF) selectable
 
-**Status:** Accepted (default revisited after evaluation; see DECISION_LOG)
+**Status:** Revised. The initial default was `hybrid`. Measurement changed it to
+`dense` (DECISION_LOG D8).
 
 **Context.** Unknown corpora contain both paraphrasable prose (where dense retrieval
 shines) and exact tokens such as product codes, error codes, section numbers and
 names (where dense retrieval with a small model is weak).
 
 **Decision.** Implement three retrievers behind one interface: `DenseRetriever`,
-`BM25Retriever` (an in-house Okapi BM25, about 80 lines, built from the stored chunks
+`BM25Retriever` (an in-house Okapi BM25, about 50 lines, built from the stored chunks
 at load time), and `HybridRetriever`, which fuses the two ranked lists with
 **reciprocal-rank fusion** (RRF, k = 60). `RAG_RETRIEVAL_MODE` selects the mode.
+
+The design-time default was hybrid. The retrieval sweep showed dense ≥ hybrid on
+every question category of the sample corpus, including exact identifiers. Hybrid
+*lost* a paraphrase question, because BM25 (no stemming) missed it and RRF then
+promoted chunks found by both retrievers above the dense-only hit. **The default is
+therefore `dense`.** Hybrid remains a one-variable switch for identifier-heavy
+corpora.
 
 **Alternatives.**
 - *Dense only*: the simplest option, but it misses exact-match queries.
@@ -197,7 +205,10 @@ scale) and a little code. RRF discards score magnitudes, so we keep the dense co
 of each candidate separately for the relevance gate (ADR-010).
 
 **Consequences.** The evaluation harness runs all three modes on the same dataset so
-the default is chosen from measured results, not preference.
+the default is chosen from measured results, not preference. That is exactly what
+happened here. The known weaknesses of our hybrid are the unstemmed BM25 and the
+equal-weight RRF. Stemming and weighted RRF are the documented next steps if a
+corpus needs lexical matching.
 
 ---
 
@@ -207,6 +218,11 @@ the default is chosen from measured results, not preference.
 
 **Context.** Cross-encoders often improve precision at the top ranks, but they add
 latency (one model forward pass per candidate) and another model download.
+
+**Evidence (DECISION_LOG D11).** At chunk size 1000, the cross-encoder raised dense
+hit@1 from 0.81 to 1.00. At 700 it changed nothing. It costs about 1.5 s p50 on CPU,
+and dense hit@5 is already 1.00, so for a generator that reads the top 5 it
+reorders passages the LLM sees anyway.
 
 **Decision.** The `Reranker` interface has two implementations: `NoOpReranker`
 (the default) and `CrossEncoderReranker` (fastembed
@@ -239,6 +255,9 @@ enough context window for top-k chunks.
 **Decision.**
 - `AnthropicProvider` uses the official `anthropic` SDK.
 - The default model is `claude-opus-5-5`, configurable through `RAG_LLM_MODEL`.
+  Sampling parameters are not sent by default, because current Opus and Sonnet models
+  reject them. `RAG_LLM_TEMPERATURE` is sent only when explicitly set, for models that
+  accept it.
 - The default effort is `low`, because grounded QA over supplied context is not a
   deep-reasoning task.
 - Structured output uses a JSON schema (`output_config.format`), so the response is
@@ -305,8 +324,8 @@ existing components drop into its nodes unchanged.
 employment". Retrieval misses, and the model correctly abstains, but the answer
 existed. Agentic loops are often added without addressing a specific failure.
 
-**Decision.** When `RAG_QUERY_REWRITE=true` and the LLM reports the context as
-insufficient (`answerable=false`), the `QueryService` asks the LLM for up to three
+**Decision.** When `RAG_QUERY_REWRITE=true` and context is judged insufficient (the
+LLM returns `answerable=false`, or the relevance gate fails), the `QueryService` asks the LLM for up to three
 alternative phrasings of the query. It retrieves again, merges the results with the
 first round (deduplicating by chunk ID), and generates **once** more. Maximum one
 retry. The context-sufficiency check is folded into the generation call's structured
@@ -353,8 +372,11 @@ handbook…") can't be checked. Models sometimes cite sources they weren't given
      warning flag.
    - `abstained`: not answerable.
 5. **Relevance gate:** if the best dense cosine among retrieved chunks is below
-   `RAG_MIN_RELEVANCE`, abstain without calling the LLM. This is cheap protection
-   against off-topic questions.
+   `RAG_MIN_RELEVANCE` (0.50 for bge-small), abstain without calling the LLM.
+   Calibration showed on-topic unanswerable questions score as high as answerable
+   ones (0.63–0.74 vs 0.60–0.86), so the gate is deliberately set to catch only
+   *off-topic* questions. Abstaining on on-topic questions is the LLM's job
+   (DECISION_LOG D9).
 
 **Alternatives.**
 - *Anthropic native citations* (document or search-result blocks): character-exact

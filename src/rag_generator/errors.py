@@ -38,6 +38,10 @@ class FileTooLargeError(IngestionError):
     pass
 
 
+class DuplicateSourceError(IngestionError):
+    """Two files in one batch map to the same source name."""
+
+
 # --- Components --------------------------------------------------------------------
 
 

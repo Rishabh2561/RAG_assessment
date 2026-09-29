@@ -24,11 +24,11 @@ def resolve_citations(
     considered, so a model that cites inline but forgets the list is not penalised.
     Returns (valid citations in citation order, invalid ids).
     """
-    candidate_ids = list(dict.fromkeys([*declared_ids, *extract_inline_ids(answer)]))
+    normalised = [_normalise_id(i) for i in [*declared_ids, *extract_inline_ids(answer)]]
+    candidate_ids = list(dict.fromkeys(i for i in normalised if i))
     citations: list[Citation] = []
     invalid: list[str] = []
     for sid in candidate_ids:
-        sid = sid.strip().strip("[]")
         passage = source_map.get(sid)
         if passage is None:
             invalid.append(sid)
@@ -52,6 +52,11 @@ def strip_invalid_markers(answer: str, invalid_ids: list[str]) -> str:
     for sid in invalid_ids:
         answer = answer.replace(f"[{sid}]", "")
     return answer
+
+
+def _normalise_id(raw: str) -> str:
+    """'[s1]', ' S1 ' and 'S1' all mean source S1."""
+    return raw.strip().strip("[]").strip().upper()
 
 
 def _snippet(text: str) -> str:

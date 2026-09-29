@@ -46,6 +46,19 @@ class TextFormatter(logging.Formatter):
         return text
 
 
+class _StderrHandler(logging.StreamHandler):
+    """Resolves ``sys.stderr`` at emit time, so a replaced stderr (tests, CLI runners)
+    is always the one written to."""
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value) -> None:
+        pass
+
+
 def configure_logging(level: str = "INFO", fmt: str = "text", log_content: bool = False) -> None:
     """Configure the package logger. Idempotent; logs go to stderr."""
     global _content_logging_enabled
@@ -55,7 +68,7 @@ def configure_logging(level: str = "INFO", fmt: str = "text", log_content: bool 
     logger.setLevel(level)
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
-    handler = logging.StreamHandler(sys.stderr)
+    handler = _StderrHandler()
     handler.setFormatter(JsonFormatter() if fmt == "json" else TextFormatter())
     logger.addHandler(handler)
     logger.propagate = False

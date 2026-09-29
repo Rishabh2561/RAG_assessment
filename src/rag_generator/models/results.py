@@ -48,6 +48,7 @@ class QueryTrace(BaseModel):
     best_dense_score: float | None = None
     gate_threshold: float | None = None
     invalid_citations: list[str] = Field(default_factory=list)
+    rewrite_error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     timings: list[StageTiming] = Field(default_factory=list)

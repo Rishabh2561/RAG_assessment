@@ -77,8 +77,11 @@ and *why* things were decided or changed.
 - **Options:** Temporary file on disk / parse from memory.
 - **Decision:** `DocumentParser.parse(data: bytes, source: str)`. PyMuPDF
   (`stream=`) and python-docx (`BytesIO`) both support this.
-- **Reason:** Uploaded documents never touch disk except in the index itself. That
-  removes a whole class of temp-file cleanup and leakage issues (09_SECURITY).
+- **Reason:** The application never writes uploaded documents to disk except in the
+  index itself. That removes a whole class of temp-file cleanup and leakage issues
+  (09_SECURITY). *Correction (D12):* Starlette itself spools multipart parts larger
+  than 1 MB to temporary files while receiving them; those are the framework's and
+  are deleted when the request ends.
 - **Trade-off:** The whole file is held in memory. Bounded by `RAG_MAX_FILE_MB`
   (50 MB by default).
 
@@ -145,3 +148,57 @@ and *why* things were decided or changed.
   answer quality, and the latency cost is large.
 - **When to revisit:** If evaluation on a new corpus shows hit@5 well below hit@20
   (right chunk retrieved but ranked out of the context window), enable it.
+
+### 2026-09-30 — D12: Fixes from an independent code review
+- **Context:** After the first full implementation, a separate reviewer agent audited
+  the codebase read-only, reproducing each finding with scratch scripts. It reported 15
+  findings. All were verified against the code, and all were accepted.
+- **Correctness fixes (each with a regression test in
+  `tests/integration/test_review_regressions.py` or the unit tests):**
+  1. A failed replace (for example an embedding-model mismatch) deleted the old
+     version first. The new version is now added before the old one is removed.
+  2. A crash between the index write and the catalog write during a delete or replace
+     left a "ghost" catalog entry that blocked re-ingestion. The collection is now
+     reconciled in both directions on open.
+  3. Files with the same base name in different directories silently replaced each
+     other. Sources are now paths relative to the inputs' common parent, and
+     duplicate names within one batch are rejected.
+  4. The chunker could drop a short trailing line ("Refund: 14 days."). Sub-minimum
+     fragments are now appended to the previous chunk, and a property test checks
+     that every word survives. The retrieval sweep was re-run and the metrics were
+     unchanged.
+  5. The BM25 cache could store a stale index under a newer store version, in a race
+     with a concurrent write. The version is now captured before the build.
+  6. An unexpected library exception aborted the whole batch. It is now caught per
+     file.
+  7. A failure in the optional rewrite call turned a valid abstention into an HTTP
+     503. It now falls back to the abstention and records `trace.rewrite_error`. An
+     empty rewrite skips the retry.
+  8. Dropping a collection could race with an in-flight write that recreated it. Drop
+     now takes the collection lock and marks the handle closed.
+  9. Re-ingesting a file whose new content duplicated another document left its old
+     content citable under its name. The stale version is now removed.
+- **Privacy and robustness:**
+  - Schema-validation errors no longer embed model output, which could quote
+    documents, in the logs.
+  - Uploads are capped at `RAG_MAX_UPLOAD_FILES` (default 20) per request.
+- **Prompt quality:** Passage text is no longer fully HTML-escaped, which had turned
+  "AT&T" into "AT&amp;T". Only our structural tags (`<source>`, `<sources>`,
+  `<question>`) are neutralised. Citation IDs are normalised before de-duplication.
+- **Trade-off:** Absorbing short tails can overflow `chunk_size` by up to
+  `min_chunk_chars` plus a newline. We accept that small overflow so no text is lost.
+- **Impact:** 19 new tests (146 offline tests in total). Docs 01 and 05 corrected.
+
+### 2026-09-30 — D13: Missing credentials must produce an actionable error (found by manual run)
+- **Context:** Running `rag ask` on a machine with no `ANTHROPIC_API_KEY` printed a
+  raw traceback. The SDK raises a bare `TypeError` ("Could not resolve authentication
+  method") that isn't an `AnthropicError`, so none of the mapped exceptions caught
+  it. The mocked provider tests couldn't reveal this, because they never exercised the
+  real client's credential resolution.
+- **Decision:** Map that `TypeError` and `anthropic.CredentialsError` to
+  `GenerationError(retryable=False)`, with guidance to set `ANTHROPIC_API_KEY` or use
+  `--no-llm`. Add a test that uses the **real** SDK client with an empty config
+  directory.
+- **Lesson:** Mock-based tests verify our mapping of *known* errors. Only a manual
+  end-to-end run exposes the errors we didn't know about. This is the most likely
+  first experience for an evaluator without a key.

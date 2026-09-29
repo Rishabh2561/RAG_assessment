@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from html import escape
+import re
 from typing import Any
 
 from rag_generator.models import RetrievedChunk
@@ -58,6 +58,20 @@ REWRITE_SCHEMA: dict[str, Any] = {
 }
 
 
+# Only the tags that structure the prompt are neutralised; all other text is passed
+# verbatim so "AT&T" or "x < 5" reach the model (and its quotes) unaltered.
+_STRUCTURAL_TAG = re.compile(r"<(/?\s*(?:sources?|question)\b)", re.IGNORECASE)
+
+
+def neutralise_tags(text: str) -> str:
+    """Stop document or question text from opening/closing the prompt delimiters."""
+    return _STRUCTURAL_TAG.sub(r"&lt;\1", text)
+
+
+def _attr(value: str) -> str:
+    return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+
+
 def source_label(index: int) -> str:
     return f"S{index}"
 
@@ -80,15 +94,15 @@ def build_answer_prompt(
         sid = source_label(len(blocks) + 1)
         page_attr = f' page="{chunk.page}"' if chunk.page is not None else ""
         blocks.append(
-            f'<source id="{sid}" file="{escape(chunk.source, quote=True)}"{page_attr}>\n'
-            f"{escape(chunk.text, quote=False)}\n</source>"
+            f'<source id="{sid}" file="{_attr(chunk.source)}"{page_attr}>\n'
+            f"{neutralise_tags(chunk.text)}\n</source>"
         )
         source_map[sid] = passage
         used += len(chunk.text)
     sources = "\n".join(blocks)
     prompt = (
         f"<sources>\n{sources}\n</sources>\n\n"
-        f"<question>\n{escape(question, quote=False)}\n</question>\n\n"
+        f"<question>\n{neutralise_tags(question)}\n</question>\n\n"
         "Answer the question using only the sources above, following your instructions."
     )
     return prompt, source_map
@@ -96,6 +110,6 @@ def build_answer_prompt(
 
 def build_rewrite_prompt(question: str, max_queries: int) -> str:
     return (
-        f"<question>\n{escape(question, quote=False)}\n</question>\n\n"
+        f"<question>\n{neutralise_tags(question)}\n</question>\n\n"
         f'Return up to {max_queries} alternative search queries in the "queries" field.'
     )

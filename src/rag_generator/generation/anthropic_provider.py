@@ -15,6 +15,10 @@ from rag_generator.errors import GenerationError
 from rag_generator.generation.base import LLMResponse
 
 SERVER_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+_NO_CREDENTIALS = (
+    "no Anthropic credentials found; set ANTHROPIC_API_KEY (environment or .env), "
+    "or run retrieval-only with --no-llm / RAG_LLM_PROVIDER=none"
+)
 
 
 class AnthropicProvider:
@@ -63,8 +67,15 @@ class AnthropicProvider:
                 f"LLM API error {exc.status_code}: {exc.message}",
                 retryable=exc.status_code >= 500,
             ) from exc
-        except anthropic.AnthropicError as exc:  # e.g. no credentials could be resolved
+        except anthropic.CredentialsError as exc:
+            raise GenerationError(f"{_NO_CREDENTIALS} ({exc})") from exc
+        except anthropic.AnthropicError as exc:
             raise GenerationError(f"LLM client error: {exc}") from exc
+        except TypeError as exc:
+            # The SDK raises a bare TypeError when no credentials can be resolved at all.
+            if "authentication method" not in str(exc):
+                raise
+            raise GenerationError(_NO_CREDENTIALS) from exc
         return self._parse(response)
 
     # --- Internals ------------------------------------------------------------------
