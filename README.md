@@ -113,7 +113,7 @@ reason: No passage was relevant enough (best similarity 0.47 < threshold 0.50).
 
 ```bash
 rag ingest data/sample/gardening -c garden
-rag ask "What can't go in the compost?" -c garden
+rag ask "What can't go in the compost?" -c garden          # add --no-llm without a key
 rag collections          # garden, northwind
 ```
 
