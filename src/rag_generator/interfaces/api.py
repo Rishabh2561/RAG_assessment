@@ -64,6 +64,7 @@ def create_app(rag: RAGApplication) -> FastAPI:
             "status": "ok",
             "version": __version__,
             "embedding_model": rag.embedder.model_id,
+            "llm_provider": rag.settings.llm_provider if rag.llm else "none",
             "llm_model": rag.llm.model_id if rag.llm else None,
             "retrieval_mode": rag.settings.retrieval_mode,
             "reranker": rag.reranker.name,

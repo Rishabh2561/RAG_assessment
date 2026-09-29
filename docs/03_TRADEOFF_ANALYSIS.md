@@ -51,7 +51,8 @@ Rating scale: **L** = low, **M** = medium, **H** = high. For *Cost*, *Latency* a
 | | LLM or hosted rerank API | Highest quality | Per-query cost; another vendor | H | H | M | H | |
 | **LLM** | Claude (hosted, `claude-opus-5-5`, effort low) | Strong grounding and abstention adherence; structured output | Per-query cost; passages sent to the API | M | M | L | H | ✅ |
 | | Cheaper hosted tier (Sonnet 5.5 / Haiku 4.5) | Lower cost and latency | Somewhat weaker instruction adherence | L | L | L | H | config option |
-| | Local (Ollama / llama.cpp) | Private; no per-call cost | GPU or slow; weaker cite-or-abstain adherence | L* | H | M | L | |
+| | OpenAI (`gpt-5.5`, strict structured outputs) | Use an existing OpenAI key; Azure and compatible servers via base URL | Answer quality not yet measured here; passages sent to OpenAI | M | M | L | H | option (ADR-014) |
+| | Local (Ollama / llama.cpp) | Private; no per-call cost | GPU or slow; weaker cite-or-abstain adherence | L* | H | M | L | via OpenAI-compatible base URL |
 | **Orchestration** | Plain Python | Transparent; testable; minimal dependencies | Glue code written by hand | L | L | L | M | ✅ |
 | | LangChain | Integrations galore | Abstraction and API churn; opaque prompts | L | L | H | M | |
 | | LangGraph | Explicit agent graphs, checkpoints | Overkill for one conditional edge | L | L | M | H | |

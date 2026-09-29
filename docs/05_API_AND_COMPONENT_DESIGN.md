@@ -35,7 +35,8 @@ flowchart TD
 ```
 
 **Vendor boundary.** `anthropic` is imported only in
-`generation/anthropic_provider.py`. `fastembed` is imported only inside
+`generation/anthropic_provider.py`, and `openai` only in the two `openai_provider.py`
+modules (loaded lazily by the factory). `fastembed` is imported only inside
 `FastEmbedProvider._load` and `CrossEncoderReranker._load`, lazily, so importing the
 package never loads a model. `pymupdf` and `docx` are imported only inside their
 parser methods. The factory is the single place that maps configuration to concrete
@@ -49,18 +50,19 @@ no base class. Tests use plain fakes that satisfy the same shape.
 | Protocol | Methods | Implementations | Contract |
 |----------|---------|-----------------|----------|
 | `DocumentParser` | `extensions: tuple[str, ...]`, `parse(data: bytes, source: str) -> ParsedDocument` | `PdfParser`, `TextParser`, `DocxParser` | Never returns a document with no text. Raises an `IngestionError` subclass for unusable input. |
-| `EmbeddingProvider` | `model_id`, `embed_documents(list[str]) -> ndarray[n, d]`, `embed_query(str) -> ndarray[d]` | `FastEmbedProvider`, `HashingEmbeddingProvider` | Vectors are L2-normalised `float32`. `model_id` uniquely identifies the vector space. |
+| `EmbeddingProvider` | `model_id`, `embed_documents(list[str]) -> ndarray[n, d]`, `embed_query(str) -> ndarray[d]` | `FastEmbedProvider`, `OpenAIEmbeddingProvider`, `HashingEmbeddingProvider` | Vectors are L2-normalised `float32`. `model_id` uniquely identifies the vector space. |
 | `VectorStore` | `version`, `model_id`, `__len__`, `add`, `delete_document`, `drop_orphans`, `search(vec, k) -> [(Chunk, score)]`, `all_chunks`, `persist` | `NumpyVectorStore` | `search` returns cosine-descending results. The store refuses vectors or queries from a different `model_id` (`IndexMismatchError`). `version` increases on every mutation. |
 | `Retriever` | `name`, `retrieve(query, k) -> RetrievalResult` | `DenseRetriever`, `BM25Retriever`, `HybridRetriever` | `RetrievalResult.best_dense_score` is `None` when the mode has no dense component. |
 | `Reranker` | `name`, `rerank(query, candidates, k) -> list[RetrievedChunk]` | `NoOpReranker`, `CrossEncoderReranker` | Returns at most `k` items, highest first. |
-| `LLMProvider` | `model_id`, `generate_json(system, user, schema) -> LLMResponse` | `AnthropicProvider` (tests: `FakeLLM`) | Returns a JSON object matching `schema`, or raises `GenerationError(retryable=…)`. Knows nothing about RAG. |
+| `LLMProvider` | `model_id`, `generate_json(system, user, schema) -> LLMResponse` | `AnthropicProvider`, `OpenAIProvider` (tests: `FakeLLM`) | Returns a JSON object matching `schema`, or raises `GenerationError(retryable=…)`. Knows nothing about RAG. |
 
 ### Adding a new implementation (examples)
 
 | Change | Work required |
 |--------|---------------|
 | pgvector store | Class `PgVectorStore` implementing `VectorStore`, plus one branch in `factory.build_repository`, plus `"pgvector"` in `Settings.vector_store`. |
-| OpenAI / Voyage embeddings | Class implementing `EmbeddingProvider`, plus one branch in `factory.build_embedder`. Existing collections will raise `IndexMismatchError` until they are re-ingested. |
+| OpenAI embeddings / LLM | **Done** this way (ADR-014): `OpenAIEmbeddingProvider` and `OpenAIProvider`, plus one branch each in `build_embedder` and `build_llm`. |
+| Voyage / Cohere embeddings | Class implementing `EmbeddingProvider`, plus one branch in `factory.build_embedder`. Existing collections will raise `IndexMismatchError` until they are re-ingested. |
 | Different LLM vendor or local model | Class implementing `LLMProvider.generate_json`, plus one branch in `factory.build_llm`. Prompts, schema and citation logic are reused unchanged. |
 | HTML parser | Class with `extensions = ("html",)`, registered in `ParserRegistry`. |
 
@@ -121,15 +123,21 @@ comments is in [`.env.example`](../.env.example). The groups are:
 
 - **Storage:** `data_dir`, `default_collection`, `max_file_mb`, `max_upload_files`.
 - **Chunking:** `chunk_size`, `chunk_overlap`, `min_chunk_chars`.
-- **Embeddings:** `embedding_provider`, `embedding_model`, `embedding_batch_size`,
+- **Embeddings:** `embedding_provider` (`fastembed` | `openai` | `hashing`), `embedding_model` (default per provider), `embedding_batch_size`,
   `hashing_dimensions`, `model_cache_dir`.
 - **Retrieval:** `retrieval_mode`, `top_k`, `candidate_pool`, `rrf_k`, `min_relevance`.
 - **Reranking:** `reranker`, `reranker_model`.
-- **Generation:** `llm_provider`, `llm_model`, `llm_effort`, `llm_max_tokens`,
+- **Generation:** `llm_provider` (`anthropic` | `openai` | `none`), `llm_model` (default per provider), `llm_effort` (Anthropic), `llm_max_tokens`,
   `llm_timeout_s`, `llm_max_retries`, `llm_temperature`, `anthropic_server_fallback`,
   `max_context_chars`, `max_question_chars`.
+- **OpenAI:** `openai_api_key` (`OPENAI_API_KEY`), `openai_base_url`, `openai_reasoning_effort`.
 - **Agentic:** `query_rewrite`, `max_rewrites`.
 - **Observability:** `log_level`, `log_format`, `log_content`.
+
+Provider-dependent defaults (`llm_model`, `embedding_model`, `min_relevance`) are resolved
+once in a validator, so all readers see concrete values. `min_relevance` resolves to
+0.50 only for the calibrated bge-small model, and to 0 (gate off, with a start-up
+warning) otherwise.
 
 Validation: enum-like fields are `Literal`s, and numeric fields have bounds. Two
 cross-field rules exist: `chunk_overlap < chunk_size` and `top_k <= candidate_pool`.

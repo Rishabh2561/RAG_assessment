@@ -56,3 +56,40 @@ def test_api_key_is_never_shown_in_repr(monkeypatch):
     s = Settings(_env_file=None)
     assert "sk-super-secret" not in repr(s)
     assert "sk-super-secret" not in s.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "overrides,llm_model,embedding_model,gate",
+    [
+        ({}, "claude-opus-5-5", "BAAI/bge-small-en-v1.5", 0.50),
+        ({"llm_provider": "openai"}, "gpt-5.5", "BAAI/bge-small-en-v1.5", 0.50),
+        ({"embedding_provider": "openai"}, "claude-opus-5-5", "text-embedding-3-small", 0.0),
+        ({"llm_provider": "none"}, None, "BAAI/bge-small-en-v1.5", 0.50),
+        ({"llm_provider": "openai", "llm_model": "gpt-5.4-mini"}, "gpt-5.4-mini", None, None),
+        ({"embedding_provider": "openai", "min_relevance": 0.3}, None, None, 0.3),
+    ],
+)
+def test_provider_dependent_defaults(overrides, llm_model, embedding_model, gate):
+    s = Settings(**overrides, _env_file=None)
+    if llm_model is not None or overrides.get("llm_provider") == "none":
+        assert s.llm_model == llm_model
+    if embedding_model is not None:
+        assert s.embedding_model == embedding_model
+    if gate is not None:
+        assert s.min_relevance == gate
+
+
+def test_uncalibrated_embedding_model_disables_gate_and_flags_it():
+    s = Settings(embedding_model="BAAI/bge-base-en-v1.5", _env_file=None)
+    assert s.min_relevance == 0.0 and s.gate_uncalibrated
+    assert not Settings(_env_file=None).gate_uncalibrated
+    explicit = Settings(embedding_model="BAAI/bge-base-en-v1.5", min_relevance=0, _env_file=None)
+    assert not explicit.gate_uncalibrated  # an explicit 0 is a deliberate choice
+
+
+def test_openai_key_from_env_is_secret(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+    monkeypatch.setenv("RAG_LLM_PROVIDER", "openai")
+    s = Settings(_env_file=None)
+    assert s.openai_api_key.get_secret_value() == "sk-openai-secret"
+    assert "sk-openai-secret" not in repr(s) and "sk-openai-secret" not in s.model_dump_json()

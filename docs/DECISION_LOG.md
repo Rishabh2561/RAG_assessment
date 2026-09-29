@@ -202,3 +202,26 @@ and *why* things were decided or changed.
 - **Lesson:** Mock-based tests verify our mapping of *known* errors. Only a manual
   end-to-end run exposes the errors we didn't know about. This is the most likely
   first experience for an evaluator without a key.
+
+### 2026-09-30 — D14: OpenAI support (generation and opt-in embeddings)
+- **Context:** Extension request: support an OpenAI API key.
+- **Options:** Chat Completions vs the Responses API; thin providers vs a multi-vendor
+  library (LiteLLM, LangChain); LLM only vs LLM plus embeddings.
+- **Decision:** `OpenAIProvider` (Chat Completions, strict JSON-schema outputs) and
+  `OpenAIEmbeddingProvider`, selected by `RAG_LLM_PROVIDER=openai` /
+  `RAG_EMBEDDING_PROVIDER=openai`. `openai` is an optional extra. Model names default
+  per provider. `RAG_OPENAI_BASE_URL` covers Azure and compatible servers. Details are
+  in ADR-014.
+- **Reason:** The interfaces made this additive. No pipeline, prompt or citation code
+  changed. Chat Completions is also the API that compatible servers implement.
+- **Trade-offs:**
+  1. The relevance gate defaults to **off** for embedding models without a
+     calibration, with a start-up warning, because D9's 0.50 is bge-specific.
+  2. OpenAI embeddings send document text to OpenAI, so they are opt-in.
+  3. `gpt-5.5` answer quality is unmeasured (no key available).
+- **Found while documenting:** `.env.example` hard-coded `RAG_LLM_MODEL=claude-opus-5-5`,
+  `RAG_EMBEDDING_MODEL` and `RAG_MIN_RELEVANCE`. Copying it and switching provider
+  would have sent a Claude model name to OpenAI. Those lines are now commented out, so
+  the per-provider defaults apply.
+- **Impact:** 34 new tests (181 offline tests in total). ADR-014. Docs 00, 03, 05, 07, 08
+  and 09 updated. `/health` reports `llm_provider`.

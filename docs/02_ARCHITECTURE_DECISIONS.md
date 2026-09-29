@@ -287,6 +287,62 @@ Tests use a scripted `FakeLLM`.
 
 ---
 
+## ADR-014 — OpenAI as a second provider for generation and (opt-in) embeddings
+
+**Status:** Accepted
+
+**Context.** Users may already hold an OpenAI key rather than an Anthropic one, or
+need a model hosted on Azure OpenAI or an OpenAI-compatible server (Ollama, vLLM).
+The `LLMProvider` and `EmbeddingProvider` interfaces were designed for exactly this
+swap. This ADR records how the second vendor was added.
+
+**Decision.**
+- `RAG_LLM_PROVIDER=openai` → `OpenAIProvider` (official `openai` SDK). It uses Chat
+  Completions **strict JSON-schema structured outputs**, so the same prompts, answer
+  schema, citation validation and abstention logic run unchanged. Our schemas already
+  meet strict mode's rules (`additionalProperties: false`, every property required),
+  and a test asserts this.
+- `RAG_EMBEDDING_PROVIDER=openai` → `OpenAIEmbeddingProvider`
+  (`text-embedding-3-small`). This is **opt-in**: it sends document text to OpenAI at
+  ingest time, which reverses ADR-003's privacy property.
+- Model names default **per provider** (`claude-opus-5-5` / `gpt-5.5`;
+  `BAAI/bge-small-en-v1.5` / `text-embedding-3-small`) when `RAG_LLM_MODEL` /
+  `RAG_EMBEDDING_MODEL` are unset. `RAG_OPENAI_BASE_URL` enables Azure and compatible
+  servers.
+- `reasoning_effort` and `temperature` are sent only when configured, because each is
+  rejected by one family of models (reasoning vs non-reasoning).
+- The `openai` package is an optional extra (`.[openai]`). The factory imports it
+  lazily and gives an install hint if it is missing.
+
+**Alternatives.**
+- *OpenAI Responses API* instead of Chat Completions: a newer surface, but Chat
+  Completions is what OpenAI-compatible servers implement, so one code path covers
+  OpenAI, Azure and Ollama.
+- *A generic multi-vendor layer (LiteLLM, LangChain)*: many vendors for free, but it
+  adds a large dependency and hides request details (structured-output support varies
+  by backend). Two thin providers are about 120 lines each.
+- *Tool calling to force JSON*: works on older models, but strict structured outputs
+  is the direct mechanism.
+
+**Trade-offs.**
+- **The relevance gate is embedding-model-specific.** The 0.50 threshold was
+  calibrated for bge-small only (D9). OpenAI embeddings produce differently scaled
+  cosine similarities, so for any uncalibrated model the gate defaults to **off**,
+  with a start-up warning, until `rag eval` suggests a value. The alternative, reusing
+  0.50 blindly, could silently reject answerable questions, which is the worse
+  failure.
+- The default OpenAI model (`gpt-5.5`) was chosen from the SDK's model list, and
+  answer quality with it has **not been measured** (no key during development). Run
+  `rag eval --answers` before relying on it.
+- Switching embedding provider requires re-ingesting. The index refuses mixed vector
+  spaces (`IndexMismatchError`).
+
+**Consequences.** The vendor boundary still holds: `openai` is imported only in
+`generation/openai_provider.py`, `embeddings/openai_provider.py` and (lazily) the
+factory. Adding a third vendor follows the same pattern.
+
+---
+
 ## ADR-008 — Orchestration: plain Python services, no framework
 
 **Status:** Accepted

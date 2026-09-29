@@ -94,7 +94,7 @@ of research papers tomorrow — with no source changes. (SOURCE)
 | Should new uploads replace or extend the index? | Replace / append / upsert | Upsert by content hash: identical content is skipped, and a changed file under the same name replaces its old chunks. | DECISION |
 | Is multi-turn chat required? | Single-shot Q&A / conversational memory | Single-shot Q&A. Conversation memory brings query-condensing complexity the brief doesn't ask for. | DECISION (out of scope) |
 | Does "agentic" behaviour need to be present? | Mandatory / only where it helps | The brief doesn't require it. We build a deterministic baseline and add one bounded corrective step (query rewrite and retry on insufficient context) behind a flag. | DECISION |
-| Which LLM vendor? | Any | Claude via the Anthropic SDK, isolated behind `LLMProvider`. | DECISION |
+| Which LLM vendor? | Any | Claude (default) or OpenAI, selected by `RAG_LLM_PROVIDER`, each isolated behind `LLMProvider` (ADR-007, ADR-014). | DECISION |
 
 ## 8. Out of scope
 

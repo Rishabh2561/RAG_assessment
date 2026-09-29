@@ -1,8 +1,12 @@
 """Typed application configuration.
 
 All environment-specific values live here. Values are read from ``RAG_*`` environment
-variables and an optional ``.env`` file; the Anthropic key uses the SDK's standard
-``ANTHROPIC_API_KEY`` name. Nothing else in the codebase should read the environment.
+variables and an optional ``.env`` file; API keys use their SDKs' standard names
+(``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``). Nothing else in the codebase should read
+the environment.
+
+Model names and the relevance threshold default per provider when left unset; the
+resolution happens once, at validation time, so every reader sees concrete values.
 """
 
 from __future__ import annotations
@@ -10,10 +14,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 RetrievalMode = Literal["dense", "bm25", "hybrid"]
+
+DEFAULT_LLM_MODELS = {"anthropic": "claude-opus-5-5", "openai": "gpt-5.5"}
+DEFAULT_EMBEDDING_MODELS = {
+    "fastembed": "BAAI/bge-small-en-v1.5",
+    "openai": "text-embedding-3-small",
+    "hashing": "hashing",
+}
+# Relevance-gate thresholds measured with `rag eval` (DECISION_LOG D9). Any other
+# embedding model gets 0.0 (gate off) until calibrated: similarity scales differ by
+# model, and an uncalibrated threshold can silently reject answerable questions.
+CALIBRATED_MIN_RELEVANCE = {("fastembed", "BAAI/bge-small-en-v1.5"): 0.50}
 
 
 class Settings(BaseSettings):
@@ -38,8 +53,8 @@ class Settings(BaseSettings):
     min_chunk_chars: int = Field(20, ge=1)
 
     # Embeddings
-    embedding_provider: Literal["fastembed", "hashing"] = "fastembed"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_provider: Literal["fastembed", "openai", "hashing"] = "fastembed"
+    embedding_model: str | None = None  # None -> DEFAULT_EMBEDDING_MODELS[provider]
     embedding_batch_size: int = Field(32, ge=1)
     hashing_dimensions: int = Field(1024, ge=64)
     model_cache_dir: Path | None = None
@@ -52,17 +67,17 @@ class Settings(BaseSettings):
     top_k: int = Field(5, ge=1, le=50)
     candidate_pool: int = Field(20, ge=1, le=200)
     rrf_k: int = Field(60, ge=1)
-    # Calibrated for bge-small-en-v1.5 (DECISION_LOG D9); recalibrate if the model changes.
-    min_relevance: float = Field(0.50, ge=0.0, le=1.0)
+    # None -> CALIBRATED_MIN_RELEVANCE for the embedding model, else 0.0 (gate off).
+    min_relevance: float | None = Field(None, ge=0.0, le=1.0)
 
     # Reranking
     reranker: Literal["none", "cross_encoder"] = "none"
     reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
 
     # Generation
-    llm_provider: Literal["anthropic", "none"] = "anthropic"
-    llm_model: str = "claude-opus-5-5"
-    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "low"
+    llm_provider: Literal["anthropic", "openai", "none"] = "anthropic"
+    llm_model: str | None = None  # None -> DEFAULT_LLM_MODELS[provider]
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "low"  # Anthropic
     llm_max_tokens: int = Field(4096, ge=256)
     llm_timeout_s: float = Field(60, gt=0)
     llm_max_retries: int = Field(2, ge=0, le=10)
@@ -70,6 +85,15 @@ class Settings(BaseSettings):
     anthropic_server_fallback: bool = True
     anthropic_api_key: SecretStr | None = Field(
         None, validation_alias=AliasChoices("ANTHROPIC_API_KEY", "RAG_ANTHROPIC_API_KEY")
+    )
+    # OpenAI (used when RAG_LLM_PROVIDER=openai and/or RAG_EMBEDDING_PROVIDER=openai)
+    openai_api_key: SecretStr | None = Field(
+        None, validation_alias=AliasChoices("OPENAI_API_KEY", "RAG_OPENAI_API_KEY")
+    )
+    openai_base_url: str | None = None  # Azure / OpenAI-compatible servers (e.g. Ollama)
+    # Only for reasoning models; sent only when set (non-reasoning models reject it).
+    openai_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = (
+        None
     )
     max_context_chars: int = Field(12000, ge=1000)
     max_question_chars: int = Field(2000, ge=10)
@@ -82,6 +106,8 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: Literal["json", "text"] = "text"
     log_content: bool = False
+
+    _gate_uncalibrated: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _check_cross_field_constraints(self) -> Settings:
@@ -96,6 +122,24 @@ class Settings(BaseSettings):
                 f"({self.candidate_pool})"
             )
         return self
+
+    @model_validator(mode="after")
+    def _resolve_provider_defaults(self) -> Settings:
+        if self.llm_model is None and self.llm_provider in DEFAULT_LLM_MODELS:
+            self.llm_model = DEFAULT_LLM_MODELS[self.llm_provider]
+        if self.embedding_model is None:
+            self.embedding_model = DEFAULT_EMBEDDING_MODELS[self.embedding_provider]
+        if self.min_relevance is None:
+            key = (self.embedding_provider, self.embedding_model)
+            self.min_relevance = CALIBRATED_MIN_RELEVANCE.get(key, 0.0)
+            self._gate_uncalibrated = key not in CALIBRATED_MIN_RELEVANCE
+        return self
+
+    @property
+    def gate_uncalibrated(self) -> bool:
+        """True when the gate was switched off automatically because no calibration
+        exists for the embedding model (an explicit RAG_MIN_RELEVANCE=0 is a choice)."""
+        return self._gate_uncalibrated
 
     @property
     def collections_dir(self) -> Path:

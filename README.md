@@ -42,11 +42,11 @@ flowchart LR
 |---------|--------|------|
 | Parsing | PyMuPDF, python-docx | Exact page numbers for citations. Pip-only install |
 | Chunking | Own recursive splitter (700 / 140 characters) | Corpus-agnostic. Never crosses pages. Size chosen by measurement |
-| Embeddings | fastembed `BAAI/bge-small-en-v1.5` (local ONNX) | No key, documents stay local, no PyTorch |
+| Embeddings | fastembed `BAAI/bge-small-en-v1.5` (local ONNX); OpenAI `text-embedding-3-small` opt-in | No key, documents stay local, no PyTorch |
 | Vector store | NumPy exact search, one atomic `index.npz` per collection | Zero infrastructure at this scale. pgvector or FAISS is a one-class swap |
 | Retrieval | Dense (BM25 and hybrid RRF available) | Dense measured best on the sample corpus |
 | Reranking | Cross-encoder available, **off** | Measured: no hit@5 gain, +1.5 s per query |
-| LLM | Claude `claude-opus-5-5` at effort `low`, via the Anthropic SDK | Best cite-or-abstain discipline. Any model via `RAG_LLM_MODEL` |
+| LLM | Claude `claude-opus-5-5` (default) or OpenAI `gpt-5.5`, via each vendor's official SDK | Strict structured JSON output on both. Any model via `RAG_LLM_MODEL`; Azure or Ollama via `RAG_OPENAI_BASE_URL` |
 | Orchestration | Plain Python | One linear pipeline plus one conditional retry. No framework needed |
 | Config | pydantic-settings, `.env` | Typed, validated, nothing hard-coded |
 | Interfaces | typer CLI, FastAPI (Swagger UI at `/docs`) | Evaluator-friendly with no front-end code |
@@ -59,7 +59,8 @@ Requires Python ≥ 3.11. Tested on 3.14 / Windows 11.
 git clone <repo> && cd rag-generator
 uv sync --extra dev             # or: python -m venv .venv && pip install -e ".[dev]"
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
-cp .env.example .env            # optional: add ANTHROPIC_API_KEY for generated answers
+uv sync --extra dev --extra openai   # only if you want the OpenAI provider (pip: ".[dev,openai]")
+cp .env.example .env            # optional: add ANTHROPIC_API_KEY or OPENAI_API_KEY for generated answers
 ```
 
 The first ingest downloads the embedding model once (about 130 MB).
@@ -117,7 +118,22 @@ rag ask "What can't go in the compost?" -c garden          # add --no-llm withou
 rag collections          # garden, northwind
 ```
 
-### 4. The REST API
+### 4. Using OpenAI instead of Claude
+
+```bash
+export OPENAI_API_KEY=sk-...
+export RAG_LLM_PROVIDER=openai          # model defaults to gpt-5.5; override with RAG_LLM_MODEL
+rag ask "What does error E-221 mean?" -c northwind
+```
+
+The prompts, citation validation and abstention logic are the same for both
+providers. Optionally, `RAG_EMBEDDING_PROVIDER=openai` switches embeddings to
+`text-embedding-3-small`. This **sends document text to OpenAI** and requires
+re-ingesting. The relevance gate then stays off until you calibrate it with `rag eval`
+(see ADR-014). `RAG_OPENAI_BASE_URL` points the OpenAI provider at Azure OpenAI or a
+compatible local server, such as Ollama at `http://localhost:11434/v1`.
+
+### 5. The REST API
 
 ```bash
 rag serve                # http://127.0.0.1:8000/docs  (upload and query from the browser)
@@ -136,15 +152,18 @@ The most useful ones:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `ANTHROPIC_API_KEY` | — | Enables generation. Without it, use `--no-llm` / `RAG_LLM_PROVIDER=none` |
-| `RAG_LLM_MODEL`, `RAG_LLM_EFFORT` | `claude-opus-5-5`, `low` | e.g. `claude-sonnet-5-5` or `claude-haiku-4-5` for lower cost |
+| `RAG_LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, or `none` (retrieval only) |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Key for the chosen provider. Without one, use `--no-llm` |
+| `RAG_LLM_MODEL` | per provider: `claude-opus-5-5` / `gpt-5.5` | e.g. `claude-sonnet-5-5` or `gpt-5.4-mini` for lower cost |
+| `RAG_LLM_EFFORT` / `RAG_OPENAI_REASONING_EFFORT` | `low` / unset | Thinking depth (Anthropic) / reasoning effort (OpenAI reasoning models) |
+| `RAG_OPENAI_BASE_URL` | — | Azure OpenAI or an OpenAI-compatible server (Ollama, vLLM) |
 | `RAG_RETRIEVAL_MODE` | `dense` | `bm25` or `hybrid` for identifier-heavy corpora |
 | `RAG_TOP_K` | `5` | Passages given to the LLM |
 | `RAG_CHUNK_SIZE`, `RAG_CHUNK_OVERLAP` | `700`, `140` | Characters |
-| `RAG_MIN_RELEVANCE` | `0.50` | Off-topic gate. **Recalibrate with `rag eval` if you change the embedding model** |
+| `RAG_MIN_RELEVANCE` | `0.50` for bge-small, otherwise off | Off-topic gate. **Calibrate with `rag eval` for any other embedding model** |
 | `RAG_RERANKER` | `none` | `cross_encoder` enables local MiniLM reranking |
 | `RAG_QUERY_REWRITE` | `false` | One bounded corrective retry when context is insufficient |
-| `RAG_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Any fastembed model. Changing it requires re-ingestion (the index refuses mixed vectors) |
+| `RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL` | `fastembed`, per provider | `openai` for hosted embeddings. Changing the model requires re-ingestion (the index refuses mixed vectors) |
 | `RAG_DATA_DIR` | `.rag_data` | Where collections are stored |
 | `RAG_LOG_FORMAT`, `RAG_LOG_CONTENT` | `text`, `false` | Use `json` for machine logs. Document text is redacted unless `RAG_LOG_CONTENT=true` |
 
@@ -153,7 +172,7 @@ Invalid configuration fails at start-up with a message naming the variable.
 ## Testing
 
 ```bash
-pytest                   # 147 tests, offline, deterministic, no key, no model download (~10 s)
+pytest                   # 181 tests, offline, deterministic, no key, no model download (~15 s)
 pytest -m slow           # + real-model retrieval regression with bge-small
 ruff check src tests scripts
 ```
@@ -185,7 +204,7 @@ design-time defaults:
 
 The full analysis, and how each metric maps to an architectural fix, is in
 [06_EVALUATION.md](docs/06_EVALUATION.md). *Answer-quality metrics haven't been run
-yet*, because no API key was available during development. The harness is
+yet* for either provider, because no API key was available during development. The harness is
 implemented and tested.
 
 ## Documentation
@@ -194,12 +213,12 @@ implemented and tested.
 |-----|----------|
 | [00 Requirements](docs/00_REQUIREMENTS.md) | Source vs spec vs assumption vs decision; acceptance criteria |
 | [01 Architecture](docs/01_ARCHITECTURE.md) | Components, flows, lifecycle, persistence, failure paths |
-| [02 ADRs](docs/02_ARCHITECTURE_DECISIONS.md) | 13 decisions: context, alternatives, trade-offs, consequences |
+| [02 ADRs](docs/02_ARCHITECTURE_DECISIONS.md) | 14 decisions: context, alternatives, trade-offs, consequences |
 | [03 Trade-offs](docs/03_TRADEOFF_ANALYSIS.md) | Decision matrix, and "why here / when the alternative wins" |
 | [04 Plan](docs/04_IMPLEMENTATION_PLAN.md) | Phases, tasks, definition of done |
 | [05 Design](docs/05_API_AND_COMPONENT_DESIGN.md) | Modules, protocols, data models, API, CLI |
 | [06 Evaluation](docs/06_EVALUATION.md) · [07 Testing](docs/07_TESTING.md) · [08 Failure modes](docs/08_FAILURE_MODES.md) · [09 Security](docs/09_SECURITY_AND_PRIVACY.md) · [10 Observability](docs/10_OBSERVABILITY.md) | |
-| [Decision log](docs/DECISION_LOG.md) | D1–D13, including revisions driven by measurement and by code review |
+| [Decision log](docs/DECISION_LOG.md) | D1–D14, including revisions driven by measurement and by code review |
 
 ## Limitations
 

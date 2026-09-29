@@ -40,7 +40,7 @@ def test_two_document_sets_without_code_changes():
 def test_docs_delete_and_drop():
     runner.invoke(app, ["ingest", str(ALT_SAMPLE_DIR), "-c", "g"])
     listing = runner.invoke(app, ["docs", "-c", "g"])
-    doc_id = listing.output.split()[0]
+    doc_id = listing.stdout.split()[0]
     assert runner.invoke(app, ["delete", doc_id, "-c", "g"]).exit_code == 0
     assert doc_id not in runner.invoke(app, ["docs", "-c", "g"]).output
     assert runner.invoke(app, ["drop", "-c", "g", "--yes"]).exit_code == 0

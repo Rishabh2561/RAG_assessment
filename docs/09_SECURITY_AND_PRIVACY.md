@@ -10,7 +10,7 @@ what we deliberately don't do, and what would change for a multi-user deployment
 |------|-------------|--------------------|
 | Uploaded file bytes | Parsed in memory; never written to disk by the application | Never |
 | Extracted text and chunks | `RAG_DATA_DIR/collections/<name>/index.npz` | Only the **top-k retrieved passages** (about 3.5k characters by default) for the question being asked, sent to the configured LLM API |
-| Embeddings | Computed locally (fastembed ONNX) | Never. There is no embedding API call |
+| Embeddings | Computed locally (fastembed ONNX, the default) | Never with the default. **With `RAG_EMBEDDING_PROVIDER=openai`, every chunk's text is sent to OpenAI at ingest time, and every question at query time** |
 | Questions | Not logged by default | Sent to the LLM along with the passages |
 
 Choosing local embeddings (ADR-003) is the main privacy decision: ingesting a
@@ -24,7 +24,7 @@ request ends. The application itself writes no temporary files.
 
 ## 2. API keys and secrets
 
-- The key is read from `ANTHROPIC_API_KEY` (environment or `.env`) into a pydantic
+- Keys are read from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (environment or `.env`) into a pydantic
   `SecretStr`, so it never appears in `repr()`, `model_dump_json()` or logs. A test
   enforces this (`test_config.py::test_api_key_is_never_shown_in_repr`).
 - `.env` is git-ignored. `.env.example` contains no secrets.
