@@ -17,14 +17,21 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "python-multipart>=0.0.9",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
 ]
 
 [project.optional-dependencies]
 openai = [
     "openai>=1.40",
 ]
+ui = [
+    "streamlit>=1.40",
+    "httpx>=0.27",
+]
 dev = [
     "openai>=1.40",
+    "streamlit>=1.40",
     "pytest>=8.0",
     "httpx>=0.27",
     "ruff>=0.5",

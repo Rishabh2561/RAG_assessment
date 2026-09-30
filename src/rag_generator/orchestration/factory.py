@@ -7,14 +7,17 @@ change here plus a new class, never a change to the pipelines.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 
 from pydantic import SecretStr
 
 from rag_generator.chunking import RecursiveChunker
-from rag_generator.config import RetrievalMode, Settings
+from rag_generator.config import DEFAULT_LLM_MODELS, RetrievalMode, Settings
 from rag_generator.embeddings import EmbeddingProvider, FastEmbedProvider, HashingEmbeddingProvider
 from rag_generator.errors import RAGError
 from rag_generator.generation import LLMProvider
@@ -27,6 +30,8 @@ from rag_generator.retrieval import BM25Retriever, DenseRetriever, HybridRetriev
 from rag_generator.storage import Collection, CollectionRepository, NumpyVectorStore
 
 logger = get_logger(__name__)
+
+_CLIENT_LLM_CACHE_SIZE = 16
 
 _OPENAI_MISSING = (
     "the OpenAI provider needs the 'openai' package: pip install -e \".[openai]\" "
@@ -96,17 +101,32 @@ def build_reranker(settings: Settings) -> Reranker:
     return NoOpReranker()
 
 
-def build_llm(settings: Settings) -> LLMProvider | None:
-    if settings.llm_provider == "none":
+def build_llm(
+    settings: Settings,
+    *,
+    provider: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> LLMProvider | None:
+    """Build the configured LLM, or one for an explicit provider/key/model (a key entered
+    in the UI). Without overrides the server's settings are used."""
+    provider = provider or settings.llm_provider
+    if provider == "none":
         return None
-    if settings.llm_provider == "openai":
+    if provider not in DEFAULT_LLM_MODELS:
+        raise RAGError(f"unknown LLM provider '{provider}'; use anthropic or openai")
+    if model is None:
+        model = settings.llm_model if provider == settings.llm_provider else None
+    model = model or DEFAULT_LLM_MODELS[provider]
+    key = api_key or _secret(settings.api_key_for(provider))
+    if provider == "openai":
         try:
             from rag_generator.generation.openai_provider import OpenAIProvider
         except ImportError as exc:
             raise RAGError(_OPENAI_MISSING) from exc
         return OpenAIProvider(
-            settings.llm_model,
-            api_key=_secret(settings.openai_api_key),
+            model,
+            api_key=key,
             base_url=settings.openai_base_url,
             max_tokens=settings.llm_max_tokens,
             reasoning_effort=settings.openai_reasoning_effort,
@@ -117,8 +137,8 @@ def build_llm(settings: Settings) -> LLMProvider | None:
     from rag_generator.generation.anthropic_provider import AnthropicProvider
 
     return AnthropicProvider(
-        settings.llm_model,
-        api_key=_secret(settings.anthropic_api_key),
+        model,
+        api_key=key,
         max_tokens=settings.llm_max_tokens,
         effort=settings.llm_effort,
         temperature=settings.llm_temperature,
@@ -163,12 +183,32 @@ class RAGApplication:
             )
         self.embedder = embedder or build_embedder(settings)
         self.llm = llm if llm is not None else build_llm(settings)
+        self._client_llms: OrderedDict[tuple[str, str, str | None], LLMProvider] = OrderedDict()
+        self._client_llms_lock = threading.Lock()
         self.reranker = reranker or build_reranker(settings)
         self.repository = build_repository(settings, self.embedder)
         self.registry = ParserRegistry()
         self.chunker = RecursiveChunker(
             settings.chunk_size, settings.chunk_overlap, settings.min_chunk_chars
         )
+
+    def llm_for(self, provider: str, api_key: str, model: str | None = None) -> LLMProvider:
+        """LLM built from a caller-supplied key (e.g. entered in the UI).
+
+        Providers are cached per (provider, key hash, model) so each request doesn't
+        create a new SDK client. The key itself is held only by the provider object.
+        """
+        cache_key = (provider, hashlib.sha256(api_key.encode()).hexdigest(), model)
+        with self._client_llms_lock:
+            llm = self._client_llms.get(cache_key)
+            if llm is None:
+                llm = build_llm(self.settings, provider=provider, api_key=api_key, model=model)
+                self._client_llms[cache_key] = llm
+                while len(self._client_llms) > _CLIENT_LLM_CACHE_SIZE:
+                    self._client_llms.popitem(last=False)
+            else:
+                self._client_llms.move_to_end(cache_key)
+            return llm
 
     def ingestion(self) -> IngestionService:
         return IngestionService(
@@ -186,15 +226,20 @@ class RAGApplication:
         mode: RetrievalMode | None = None,
         top_k: int | None = None,
         use_llm: bool = True,
+        rewrite: bool | None = None,
+        llm: LLMProvider | None = None,
     ) -> QueryService:
+        """``llm`` overrides the server's LLM for this query (a caller-supplied key)."""
         collection = self.repository.open(collection_name)
         options = query_options(self.settings)
         if top_k is not None:
             options = replace(options, top_k=top_k)
+        if rewrite is not None:
+            options = replace(options, query_rewrite=rewrite)
         return QueryService(
             collection,
             build_retriever(self.settings, collection, self.embedder, mode),
             self.reranker,
-            self.llm if use_llm else None,
+            (llm or self.llm) if use_llm else None,
             options,
         )

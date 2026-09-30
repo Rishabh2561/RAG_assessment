@@ -164,25 +164,23 @@ def evaluate(
     ),
 ) -> None:
     """Evaluate retrieval (and optionally answers) against a labelled dataset."""
-    from rag_generator.evaluation import EvaluationRunner, load_dataset
-    from rag_generator.orchestration.factory import build_reranker
+    from rag_generator.evaluation import load_dataset, run_evaluation
 
     settings = _settings(llm_provider=None if answers else "none")
     name = collection or settings.default_collection
-    items = load_dataset(dataset)
-    application = RAGApplication(settings)
     try:
-        runner = EvaluationRunner(application, name)
-        report: dict = {"dataset": str(dataset), "collection": name, "n_items": len(items)}
-        report["retrieval"] = []
-        for reranker_name in [r.strip() for r in rerankers.split(",") if r.strip()]:
-            reranker = build_reranker(settings.model_copy(update={"reranker": reranker_name}))
-            for mode in [m.strip() for m in modes.split(",") if m.strip()]:
-                result = runner.evaluate_retrieval(items, mode, reranker)
-                report["retrieval"].append(result.__dict__)
-        if answers:
-            report["answers"] = runner.evaluate_answers(items, judge=judge)
-    except RAGError as exc:
+        items = load_dataset(dataset)
+        report = run_evaluation(
+            RAGApplication(settings),
+            name,
+            items,
+            modes=[m.strip() for m in modes.split(",") if m.strip()],
+            rerankers=[r.strip() for r in rerankers.split(",") if r.strip()],
+            answers=answers,
+            judge=judge,
+            dataset_name=str(dataset),
+        )
+    except (RAGError, ValueError) as exc:
         raise _fail(exc) from exc
 
     _print_eval(report)
@@ -204,6 +202,89 @@ def serve(
 
     settings = _settings()
     uvicorn.run(create_app(RAGApplication(settings)), host=host, port=port)
+
+
+@app.command()
+def ui(
+    api_url: Annotated[
+        str, typer.Option(help="REST API the UI talks to.", envvar="RAG_UI_API_URL")
+    ] = "http://127.0.0.1:8000",
+    port: Annotated[int, typer.Option(help="Port for the UI.")] = 8501,
+    host: Annotated[
+        str, typer.Option(help="Interface to bind; 127.0.0.1 keeps the UI local (no auth).")
+    ] = "127.0.0.1",
+    with_api: Annotated[
+        bool, typer.Option("--with-api", help="Also start `rag serve` at --api-url.")
+    ] = False,
+) -> None:
+    """Run the Streamlit web UI (talks to the REST API over HTTP)."""
+    import importlib.util
+    import os
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("streamlit") is None:
+        raise _fail(
+            RAGError('the UI needs Streamlit: pip install -e ".[ui]" (or uv sync --extra ui)')
+        )
+    app_path = Path(__file__).resolve().parent.parent / "ui" / "app.py"
+    api = _start_api(api_url) if with_api else None
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "streamlit",
+                "run",
+                str(app_path),
+                "--server.port",
+                str(port),
+                "--server.address",
+                host,
+                "--browser.gatherUsageStats",
+                "false",
+            ],
+            env={**os.environ, "RAG_UI_API_URL": api_url},
+            check=False,
+        )
+    finally:
+        if api is not None:
+            api.terminate()
+
+
+def _start_api(api_url: str):
+    """Start `rag serve` for --with-api and wait until /health answers."""
+    import subprocess
+    import sys
+    import time
+    from urllib.error import URLError
+    from urllib.parse import urlparse
+    from urllib.request import urlopen
+
+    parsed = urlparse(api_url)
+    command = [
+        sys.executable,
+        "-m",
+        "rag_generator.interfaces.cli",
+        "serve",
+        "--host",
+        parsed.hostname or "127.0.0.1",
+        "--port",
+        str(parsed.port or 8000),
+    ]
+    process = subprocess.Popen(command)
+    typer.echo(f"Starting the API at {api_url} (the first start loads the embedding model)…")
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise _fail(RAGError("the API process exited; see its output above"))
+        try:
+            with urlopen(f"{api_url.rstrip('/')}/health", timeout=2):
+                return process
+        except (URLError, OSError):
+            time.sleep(1)
+    process.terminate()
+    raise _fail(RAGError(f"the API did not become healthy at {api_url} within 120 s"))
 
 
 # --- Output formatting ----------------------------------------------------------------
@@ -266,10 +347,8 @@ def _print_eval(report: dict) -> None:
     typer.echo(header)
     for r in report["retrieval"]:
         m = r["metrics"]
-        typer.echo(
-            f"{r['mode']:<8} {r['reranker']:<14} {m['hit@1']:>6.3f} {m['hit@3']:>6.3f} "
-            f"{m['hit@5']:>6.3f} {m['mrr@10']:>6.3f} {m['latency_p50_ms']:>7.1f}"
-        )
+        values = " ".join(_num(m[k], 6) for k in ("hit@1", "hit@3", "hit@5", "mrr@10"))
+        typer.echo(f"{r['mode']:<8} {r['reranker']:<14} {values} {_num(m['latency_p50_ms'], 7, 1)}")
     for r in report["retrieval"]:
         if r["calibration"]:
             c = r["calibration"]
@@ -283,6 +362,15 @@ def _print_eval(report: dict) -> None:
     if "answers" in report:
         typer.echo("\nAnswers")
         for key, value in report["answers"]["metrics"].items():
-            typer.echo(
-                f"  {key:<24} {value:.3f}" if isinstance(value, float) else f"  {key:<24} {value}"
-            )
+            shown = _num(value, 0) if value is None or isinstance(value, float) else value
+            typer.echo(f"  {key:<24} {shown}")
+
+
+def _num(value: float | None, width: int, decimals: int = 3) -> str:
+    """Format a metric; undefined metrics (None, e.g. no answerable items) print as n/a."""
+    text = "n/a" if value is None else f"{value:.{decimals}f}"
+    return f"{text:>{width}}"
+
+
+if __name__ == "__main__":  # allows `python -m rag_generator.interfaces.cli`
+    app()

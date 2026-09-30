@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from rag_generator.errors import RAGError
+from rag_generator.errors import InvalidQueryError, RAGError
 from rag_generator.evaluation.dataset import EvalItem
 from rag_generator.evaluation.metrics import (
     best_threshold,
@@ -19,7 +20,7 @@ from rag_generator.evaluation.metrics import (
 )
 from rag_generator.generation import LLMProvider
 from rag_generator.models import Answer
-from rag_generator.orchestration.factory import RAGApplication, build_retriever
+from rag_generator.orchestration.factory import RAGApplication, build_reranker, build_retriever
 from rag_generator.reranking import Reranker
 
 K_VALUES = (1, 3, 5, 10)
@@ -111,10 +112,14 @@ class EvaluationRunner:
 
     # --- Answers --------------------------------------------------------------------
 
-    def evaluate_answers(self, items: list[EvalItem], judge: bool = False) -> dict[str, Any]:
-        service = self.app.query(self.collection_name)
+    def evaluate_answers(
+        self, items: list[EvalItem], judge: bool = False, llm: LLMProvider | None = None
+    ) -> dict[str, Any]:
+        service = self.app.query(self.collection_name, llm=llm)
         if service.llm is None:
-            raise RAGError("answer evaluation needs an LLM; set RAG_LLM_PROVIDER=anthropic")
+            raise InvalidQueryError(
+                "answer evaluation needs an LLM; set RAG_LLM_PROVIDER=anthropic or openai"
+            )
         rows: list[dict[str, Any]] = []
         for item in items:
             try:
@@ -210,3 +215,59 @@ def _aggregate_answers(rows: list[dict[str, Any]]) -> dict[str, float]:
         "avg_input_tokens": mean([r["input_tokens"] for r in ok]),
         "avg_output_tokens": mean([r["output_tokens"] for r in ok]),
     }
+
+
+RETRIEVAL_MODES = ("dense", "bm25", "hybrid")
+RERANKERS = ("none", "cross_encoder")
+
+
+def run_evaluation(
+    app: RAGApplication,
+    collection: str,
+    items: list[EvalItem],
+    *,
+    modes: list[str],
+    rerankers: list[str] | None = None,
+    answers: bool = False,
+    judge: bool = False,
+    dataset_name: str = "",
+    llm: LLMProvider | None = None,
+) -> dict[str, Any]:
+    """Run retrieval (every mode x reranker) and optionally answer evaluation.
+
+    Shared by the CLI and the REST API so both produce the same report shape.
+    """
+    rerankers = rerankers or ["none"]
+    unknown = [m for m in modes if m not in RETRIEVAL_MODES] + [
+        r for r in rerankers if r not in RERANKERS
+    ]
+    if unknown or not modes:
+        raise InvalidQueryError(
+            f"unknown or missing retrieval modes/rerankers: {unknown or modes}; "
+            f"modes: {', '.join(RETRIEVAL_MODES)}; rerankers: {', '.join(RERANKERS)}"
+        )
+    runner = EvaluationRunner(app, collection)
+    report: dict[str, Any] = {
+        "dataset": dataset_name,
+        "collection": collection,
+        "n_items": len(items),
+        "retrieval": [],
+    }
+    for reranker_name in rerankers:
+        reranker = build_reranker(app.settings.model_copy(update={"reranker": reranker_name}))
+        for mode in modes:
+            report["retrieval"].append(runner.evaluate_retrieval(items, mode, reranker).__dict__)
+    if answers:
+        report["answers"] = runner.evaluate_answers(items, judge=judge, llm=llm)
+    return json_safe(report)
+
+
+def json_safe(value: Any) -> Any:
+    """Replace NaN/inf (undefined metrics) with None so the report is valid JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_safe(v) for v in value]
+    return value

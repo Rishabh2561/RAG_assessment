@@ -38,7 +38,7 @@ of research papers tomorrow — with no source changes. (SOURCE)
 | ID | Requirement | Traces to | Tag |
 |----|-------------|-----------|-----|
 | F1 | Ingest documents supplied while the application is running, via CLI (file paths or directories) and via HTTP upload. | S1 | DECISION (two entry points) |
-| F2 | Support at least PDF, plain text, Markdown and DOCX. | S1, S4 | ASSUMPTION (the brief names no formats; these cover the common cases) |
+| F2 | Support at least PDF, plain text, Markdown and DOCX; also PPTX, XLSX/XLSM and CSV/TSV (added on request, D15). | S1, S4 | ASSUMPTION (the brief names no formats; these cover the common cases) |
 | F3 | Create or update a persistent index for the ingested documents; re-ingesting an unchanged file is a no-op. | S2 | SPEC + DECISION (idempotency) |
 | F4 | Keep separate document sets in separate, named **collections**, so different sets never contaminate each other's answers. | S4 | DECISION |
 | F5 | Accept a natural-language question against a collection. | S3 | SOURCE |
@@ -89,7 +89,7 @@ of research papers tomorrow — with no source changes. (SOURCE)
 
 | Ambiguity | Options | Resolution | Tag |
 |-----------|---------|------------|-----|
-| What interface should users interact through? | Web UI / REST API / CLI / notebook | A CLI for evaluators and scripting, plus a FastAPI REST API whose Swagger UI lets you upload files and ask questions in a browser. No bespoke front-end. | DECISION |
+| What interface should users interact through? | Web UI / REST API / CLI / notebook | A CLI for evaluators and scripting, a FastAPI REST API (with Swagger UI), and a Streamlit web UI that talks to the API over HTTP (added later, ADR-012 revision). | DECISION |
 | What counts as "grounded"? | Answer merely uses retrieval / answer cites sources / answer is verified against sources | Every answer must cite retrieved passage IDs. Citations are validated against what was actually retrieved, and the system abstains when evidence is insufficient. Faithfulness is *measured* in evaluation, not guaranteed at runtime. | DECISION |
 | Should new uploads replace or extend the index? | Replace / append / upsert | Upsert by content hash: identical content is skipped, and a changed file under the same name replaces its old chunks. | DECISION |
 | Is multi-turn chat required? | Single-shot Q&A / conversational memory | Single-shot Q&A. Conversation memory brings query-condensing complexity the brief doesn't ask for. | DECISION (out of scope) |
@@ -103,7 +103,7 @@ of research papers tomorrow — with no source changes. (SOURCE)
 - Authentication, authorisation and multi-tenant isolation beyond named collections.
 - Conversational memory and follow-up question rewriting.
 - Horizontal scaling, background job queues and distributed indexes.
-- A custom web front-end (Swagger UI and the CLI serve this role).
+- A bespoke JavaScript front-end. A Streamlit UI (`rag ui`) covers the browser use case.
 - Fine-tuning of embedding or generation models.
 
 ## 9. Acceptance criteria

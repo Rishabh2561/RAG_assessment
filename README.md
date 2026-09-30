@@ -1,6 +1,7 @@
 # RAG Generator
 
-Hand it **any set of documents at runtime** (PDF, DOCX, Markdown, text) and ask
+Hand it **any set of documents at runtime** (PDF, DOCX, PowerPoint, Excel, CSV,
+Markdown, text) and ask
 questions. Answers are grounded in those documents, with checkable citations (file,
 page, passage), and the system says "not found" instead of guessing. Different
 document sets live in separate **collections**, so no code changes are needed.
@@ -15,7 +16,7 @@ document sets live in separate **collections**, so no code changes are needed.
 flowchart LR
     U[CLI / REST API] --> I[IngestionService]
     U --> Q[QueryService]
-    I --> P[Parse<br/>PyMuPDF · docx · text] --> C[Chunk<br/>recursive, page-bounded] --> E[Embed<br/>local bge-small ONNX] --> S[(Collection<br/>NumPy index + catalog)]
+    I --> P[Parse<br/>PyMuPDF · docx · pptx · xlsx · csv · text] --> C[Chunk<br/>recursive, page-bounded] --> E[Embed<br/>local bge-small ONNX] --> S[(Collection<br/>NumPy index + catalog)]
     Q --> R[Retrieve<br/>dense · bm25 · hybrid] --> S
     R --> RR[Rerank<br/>off by default] --> G{Relevance<br/>gate}
     G -- off-topic --> A0[Abstain, no LLM call]
@@ -40,7 +41,7 @@ flowchart LR
 
 | Concern | Choice | Why (short version; details in [02](docs/02_ARCHITECTURE_DECISIONS.md) and [03](docs/03_TRADEOFF_ANALYSIS.md)) |
 |---------|--------|------|
-| Parsing | PyMuPDF, python-docx | Exact page numbers for citations. Pip-only install |
+| Parsing | PyMuPDF, python-docx, python-pptx, openpyxl, stdlib `csv` | Exact page (or slide) numbers for citations. Spreadsheet rows keep their column names. Pip-only install |
 | Chunking | Own recursive splitter (700 / 140 characters) | Corpus-agnostic. Never crosses pages. Size chosen by measurement |
 | Embeddings | fastembed `BAAI/bge-small-en-v1.5` (local ONNX); OpenAI `text-embedding-3-small` opt-in | No key, documents stay local, no PyTorch |
 | Vector store | NumPy exact search, one atomic `index.npz` per collection | Zero infrastructure at this scale. pgvector or FAISS is a one-class swap |
@@ -49,7 +50,7 @@ flowchart LR
 | LLM | Claude `claude-opus-5-5` (default) or OpenAI `gpt-5.5`, via each vendor's official SDK | Strict structured JSON output on both. Any model via `RAG_LLM_MODEL`; Azure or Ollama via `RAG_OPENAI_BASE_URL` |
 | Orchestration | Plain Python | One linear pipeline plus one conditional retry. No framework needed |
 | Config | pydantic-settings, `.env` | Typed, validated, nothing hard-coded |
-| Interfaces | typer CLI, FastAPI (Swagger UI at `/docs`) | Evaluator-friendly with no front-end code |
+| Interfaces | typer CLI, FastAPI (Swagger UI at `/docs`), Streamlit web UI over the API | The UI is a pure HTTP client, so one backend serves every interface |
 
 ## Quick start
 
@@ -133,7 +134,36 @@ re-ingesting. The relevance gate then stays off until you calibrate it with `rag
 (see ADR-014). `RAG_OPENAI_BASE_URL` points the OpenAI provider at Azure OpenAI or a
 compatible local server, such as Ollama at `http://localhost:11434/v1`.
 
-### 5. The REST API
+### 5. The web UI
+
+```bash
+uv sync --extra ui                     # or: pip install -e ".[ui]"
+rag ui --with-api                      # starts `rag serve` + the UI -> http://localhost:8501
+# or, with the API already running elsewhere:
+rag ui --api-url http://127.0.0.1:8000
+```
+
+- **Ask:** chat with a collection. Answers show a status badge, inline citation
+  chips, source cards (file, page, snippet), the retrieved passages, and a trace
+  (stage timings, tokens, similarity vs gate). Query options cover retrieval mode,
+  top-k, retrieval-only and corrective rewrite.
+- **Documents:** upload files; the accepted types and limits come from the server.
+  See the per-file ingest report, list documents, delete documents, and drop the
+  collection after confirming.
+- **Evaluate:** upload a JSONL dataset, compare retrieval modes and rerankers, see
+  the suggested relevance-gate threshold, optionally score answers, and download the
+  report.
+- **System:** active LLM and embedding models, and the server defaults.
+- **Answer model (sidebar):** choose *Server default*, or *My API key* and paste an
+  **Anthropic (`sk-ant-…`) or OpenAI (`sk-…`) key**. The provider is detected from
+  the key (you can override it or set a model), and "Check key" validates it with one
+  tiny call. The key stays in your browser session and is sent to the API with each
+  request. The server never stores or logs it.
+
+The UI talks to the backend only over HTTP, so it can run on a different machine
+from the API. It binds to `127.0.0.1` by default because it has no authentication.
+
+### 6. The REST API
 
 ```bash
 rag serve                # http://127.0.0.1:8000/docs  (upload and query from the browser)
@@ -152,7 +182,8 @@ The most useful ones:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RAG_LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, or `none` (retrieval only) |
+| `RAG_LLM_PROVIDER` | `auto` | `auto` uses whichever key is set (Anthropic first, retrieval-only if neither); or force `anthropic`, `openai` or `none` |
+| `RAG_ALLOW_CLIENT_LLM_KEYS` | `true` | Let the UI / API clients use their own key per request (`X-LLM-API-Key` header) |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Key for the chosen provider. Without one, use `--no-llm` |
 | `RAG_LLM_MODEL` | per provider: `claude-opus-5-5` / `gpt-5.5` | e.g. `claude-sonnet-5-5` or `gpt-5.4-mini` for lower cost |
 | `RAG_LLM_EFFORT` / `RAG_OPENAI_REASONING_EFFORT` | `low` / unset | Thinking depth (Anthropic) / reasoning effort (OpenAI reasoning models) |
@@ -172,7 +203,7 @@ Invalid configuration fails at start-up with a message naming the variable.
 ## Testing
 
 ```bash
-pytest                   # 181 tests, offline, deterministic, no key, no model download (~15 s)
+pytest                   # 259 tests, offline, deterministic, no key, no model download (~50 s)
 pytest -m slow           # + real-model retrieval regression with bge-small
 ruff check src tests scripts
 ```
@@ -218,7 +249,7 @@ implemented and tested.
 | [04 Plan](docs/04_IMPLEMENTATION_PLAN.md) | Phases, tasks, definition of done |
 | [05 Design](docs/05_API_AND_COMPONENT_DESIGN.md) | Modules, protocols, data models, API, CLI |
 | [06 Evaluation](docs/06_EVALUATION.md) · [07 Testing](docs/07_TESTING.md) · [08 Failure modes](docs/08_FAILURE_MODES.md) · [09 Security](docs/09_SECURITY_AND_PRIVACY.md) · [10 Observability](docs/10_OBSERVABILITY.md) | |
-| [Decision log](docs/DECISION_LOG.md) | D1–D14, including revisions driven by measurement and by code review |
+| [Decision log](docs/DECISION_LOG.md) | D1–D16, including revisions driven by measurement and by code review |
 
 ## Limitations
 

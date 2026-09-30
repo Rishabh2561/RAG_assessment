@@ -4,11 +4,18 @@ from pydantic import ValidationError
 from rag_generator.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def no_real_keys(monkeypatch):
+    """Keep these tests independent of keys set on the developer's machine."""
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "RAG_LLM_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+
+
 def test_defaults_are_valid():
     s = Settings(_env_file=None)
     assert s.chunk_overlap < s.chunk_size
     assert s.top_k <= s.candidate_pool
-    assert s.llm_model  # not hard-coded elsewhere; configurable here
+    assert s.llm_provider == "none" and s.llm_provider_auto  # auto: no key -> retrieval only
 
 
 def test_environment_overrides_defaults(monkeypatch):
@@ -61,9 +68,9 @@ def test_api_key_is_never_shown_in_repr(monkeypatch):
 @pytest.mark.parametrize(
     "overrides,llm_model,embedding_model,gate",
     [
-        ({}, "claude-opus-5-5", "BAAI/bge-small-en-v1.5", 0.50),
+        ({"llm_provider": "anthropic"}, "claude-opus-5-5", "BAAI/bge-small-en-v1.5", 0.50),
         ({"llm_provider": "openai"}, "gpt-5.5", "BAAI/bge-small-en-v1.5", 0.50),
-        ({"embedding_provider": "openai"}, "claude-opus-5-5", "text-embedding-3-small", 0.0),
+        ({"embedding_provider": "openai"}, None, "text-embedding-3-small", 0.0),
         ({"llm_provider": "none"}, None, "BAAI/bge-small-en-v1.5", 0.50),
         ({"llm_provider": "openai", "llm_model": "gpt-5.4-mini"}, "gpt-5.4-mini", None, None),
         ({"embedding_provider": "openai", "min_relevance": 0.3}, None, None, 0.3),
@@ -93,3 +100,64 @@ def test_openai_key_from_env_is_secret(monkeypatch):
     s = Settings(_env_file=None)
     assert s.openai_api_key.get_secret_value() == "sk-openai-secret"
     assert "sk-openai-secret" not in repr(s) and "sk-openai-secret" not in s.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "keys,provider,model",
+    [
+        ({}, "none", None),
+        ({"ANTHROPIC_API_KEY": "sk-ant-x"}, "anthropic", "claude-opus-5-5"),
+        ({"OPENAI_API_KEY": "sk-proj-x"}, "openai", "gpt-5.5"),
+        ({"ANTHROPIC_API_KEY": "sk-ant-x", "OPENAI_API_KEY": "sk-proj-x"}, "anthropic", None),
+        ({"ANTHROPIC_API_KEY": "  "}, "none", None),  # blank key counts as absent
+    ],
+)
+def test_auto_provider_follows_whichever_key_is_configured(monkeypatch, keys, provider, model):
+    for var, value in keys.items():
+        monkeypatch.setenv(var, value)
+    s = Settings(_env_file=None)
+    assert s.llm_provider == provider
+    if model:
+        assert s.llm_model == model
+
+
+def test_explicit_provider_is_not_auto(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-x")
+    s = Settings(llm_provider="anthropic", _env_file=None)
+    assert s.llm_provider == "anthropic" and not s.llm_provider_auto
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        ("sk-ant-api03-abc", "anthropic"),
+        ("  sk-ant-admin01-abc ", "anthropic"),
+        ("sk-proj-abc", "openai"),
+        ("sk-svcacct-abc", "openai"),
+        ("sk-abc123", "openai"),
+        ("AIzaSy-not-supported", None),
+        ("", None),
+    ],
+)
+def test_detect_provider_from_key_format(key, expected):
+    from rag_generator.config import detect_provider
+
+    assert detect_provider(key) == expected
+
+
+def test_blank_or_comment_key_values_count_as_unset(tmp_path):
+    """Regression: dotenv parses `KEY=   # note` as the value '# note'."""
+    env = tmp_path / ".env"
+    env.write_text("ANTHROPIC_API_KEY=   # set me\nOPENAI_API_KEY=\n")
+    s = Settings(_env_file=env)
+    assert s.anthropic_api_key is None and s.openai_api_key is None
+    assert s.llm_provider == "none"
+
+
+def test_env_example_resolves_to_retrieval_only_until_a_key_is_added():
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[2] / ".env.example"
+    s = Settings(_env_file=example)
+    assert s.anthropic_api_key is None and s.openai_api_key is None
+    assert s.llm_provider == "none" and s.allow_client_llm_keys

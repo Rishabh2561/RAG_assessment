@@ -7,7 +7,14 @@ from rag_generator.errors import (
     UnsupportedFileTypeError,
 )
 from rag_generator.ingestion import ParserRegistry
-from tests.conftest import SAMPLE_DIR, make_docx, make_image_only_pdf, make_pdf
+from tests.conftest import (
+    SAMPLE_DIR,
+    make_docx,
+    make_image_only_pdf,
+    make_pdf,
+    make_pptx,
+    make_xlsx,
+)
 
 
 @pytest.fixture
@@ -73,7 +80,85 @@ def test_blank_pdf_is_empty(registry):
         registry.parse(make_pdf([""]), "blank.pdf")
 
 
-@pytest.mark.parametrize("name", ["data.xlsx", "image.png", "noextension"])
+@pytest.mark.parametrize("name", ["legacy.xls", "legacy.ppt", "image.png", "noextension"])
 def test_unsupported_types(registry, name):
     with pytest.raises(UnsupportedFileTypeError, match="Supported"):
         registry.parse(b"whatever", name)
+
+
+def test_csv_rows_carry_header_names(registry):
+    data = b"Region,Revenue,Owner\nWest,1200,Ana\n\nEast,,Raj\n"
+    doc = registry.parse(data, "sales.csv")
+    assert doc.file_type == "csv"
+    assert doc.sections[0].page is None
+    assert doc.sections[0].text.split("\n") == [
+        "Row 2: Region: West | Revenue: 1200 | Owner: Ana",
+        "Row 4: Region: East | Owner: Raj",
+    ]
+
+
+def test_csv_sniffs_semicolons_and_handles_tsv_and_latin1(registry):
+    doc = registry.parse("Name;City\nJosé;Málaga\n".encode("latin-1"), "people.csv")
+    assert doc.sections[0].text == "Row 2: Name: José | City: Málaga"
+    assert doc.warnings
+    tsv = registry.parse(b"a\tb\n1\t2\n", "t.tsv")
+    assert tsv.sections[0].text == "Row 2: a: 1 | b: 2"
+
+
+def test_csv_extra_cells_and_header_only(registry):
+    doc = registry.parse(b"id,name\n7,x,overflow\n", "e.csv")
+    assert doc.sections[0].text == "Row 2: id: 7 | name: x | Column 3: overflow"
+    assert registry.parse(b"id,name\n", "h.csv").sections[0].text == "Columns: id | name"
+
+
+@pytest.mark.parametrize("data", [b"", b" \n,,\n"])
+def test_empty_csv(registry, data):
+    with pytest.raises(EmptyDocumentError):
+        registry.parse(data, "empty.csv")
+
+
+def test_xlsx_one_section_per_sheet_with_sheet_name(registry):
+    import datetime
+
+    data = make_xlsx(
+        {
+            "Prices": [["SKU", "Price", "Since"], ["NW-200", 4999.0, datetime.date(2025, 3, 1)]],
+            "Empty": [],
+            "Stock": [["SKU", "Qty", "Active"], ["NW-C2", 12, True]],
+        }
+    )
+    doc = registry.parse(data, "catalog.xlsx")
+    assert doc.file_type == "xlsx"
+    assert [s.text for s in doc.sections] == [
+        "[Prices] Row 2: SKU: NW-200 | Price: 4999 | Since: 2025-03-01",
+        "[Stock] Row 2: SKU: NW-C2 | Qty: 12 | Active: TRUE",
+    ]
+
+
+def test_empty_and_corrupt_xlsx(registry):
+    with pytest.raises(EmptyDocumentError):
+        registry.parse(make_xlsx({"Sheet1": []}), "blank.xlsx")
+    with pytest.raises(CorruptDocumentError):
+        registry.parse(b"PK\x03\x04 not a zip", "broken.xlsx")
+
+
+def test_pptx_slides_are_pages_with_notes_and_tables(registry):
+    data = make_pptx(
+        [["Quarterly review", "Revenue grew 12%"], [], ["Roadmap"]],
+        notes={1: "Mention the NW-200 launch."},
+        table=[["Quarter", "Goal"], ["Q3", "Ship firmware 3.3"]],
+    )
+    doc = registry.parse(data, "deck.pptx")
+    assert doc.file_type == "pptx"
+    assert [s.page for s in doc.sections] == [1, 3]
+    assert "Revenue grew 12%" in doc.sections[0].text
+    assert "Notes: Mention the NW-200 launch." in doc.sections[0].text
+    assert "Q3 | Ship firmware 3.3" in doc.sections[1].text
+    assert any("[2]" in w for w in doc.warnings)
+
+
+def test_empty_and_corrupt_pptx(registry):
+    with pytest.raises(EmptyDocumentError):
+        registry.parse(make_pptx([[]]), "blank.pptx")
+    with pytest.raises(CorruptDocumentError):
+        registry.parse(b"PK\x03\x04 not a zip", "broken.pptx")

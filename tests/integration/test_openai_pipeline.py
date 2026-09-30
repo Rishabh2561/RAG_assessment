@@ -53,7 +53,8 @@ def test_factory_selects_openai_providers():
     embedder = build_embedder(s)
     assert isinstance(embedder, OpenAIEmbeddingProvider)
     assert embedder.model_id == "openai:text-embedding-3-small"
-    assert isinstance(build_llm(Settings(_env_file=None)), AnthropicProvider)  # default unchanged
+    anthropic = Settings(llm_provider="anthropic", _env_file=None)
+    assert isinstance(build_llm(anthropic), AnthropicProvider)
 
 
 def test_grounded_answer_through_openai_provider(make_app):

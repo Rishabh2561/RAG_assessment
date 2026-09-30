@@ -18,7 +18,8 @@ src/rag_generator/
 ├── generation/      LLMProvider protocol, prompts + schemas, citation validation, AnthropicProvider.
 ├── orchestration/   IngestionService, QueryService, factory (composition root), RAGApplication.
 ├── evaluation/      Dataset schema, pure metrics, EvaluationRunner.
-└── interfaces/      cli.py (typer), api.py (FastAPI): thin adapters.
+├── interfaces/      cli.py (typer), api.py (FastAPI): thin adapters.
+└── ui/              Streamlit app: HTTP client, formatting helpers, views (API client only).
 ```
 
 Dependencies point downwards only:
@@ -155,7 +156,18 @@ The API runs with `rag serve`. Interactive documentation is at `http://127.0.0.1
 | `GET /collections/{c}/documents` | — | `list[DocumentRecord]` | 404 |
 | `DELETE /collections/{c}/documents/{doc_id}` | — | `DocumentRecord` | 404 |
 | `DELETE /collections/{c}` | — | 204 | 404 |
-| `POST /collections/{c}/query` | `{question, top_k?, mode?, retrieval_only?, include_passages?}` | `Answer` | 400 invalid question · 404 no collection · 409 empty collection or index mismatch · 422 schema · 503 LLM failure (`retryable` flag) |
+| `GET /config` | — | supported extensions, limits, active LLM and embedding models, whether client keys are accepted, default model per provider, retrieval modes, rerankers, defaults (no secrets) | — |
+| `POST /llm/verify` | optional `X-LLM-*` headers | `{ok, provider, model, detail?}`, from one tiny LLM call | 400 bad headers · 403 client keys disabled |
+| `POST /collections/{c}/evaluate` | multipart `dataset` (JSONL) + form `modes`, `rerankers`, `answers`, `judge` | evaluation report (same shape as `rag eval`; undefined metrics are `null`) | 400 bad dataset, unknown mode, or answers without an LLM · 404 · 413 |
+| `POST /collections/{c}/query` | `{question, top_k?, mode?, retrieval_only?, rewrite?, include_passages?}` | `Answer` | 400 invalid question · 404 no collection · 409 empty collection or index mismatch · 422 schema · 503 LLM failure (`retryable` flag) |
+
+**Caller-supplied keys.** `/query`, `/evaluate` and `/llm/verify` accept
+`X-LLM-API-Key`, optional `X-LLM-Provider` (`auto` \| `anthropic` \| `openai`;
+`auto` detects the provider from the key: `sk-ant-…` is Anthropic, any other `sk-…` is
+OpenAI) and optional `X-LLM-Model`. The API builds a provider for that request via
+`RAGApplication.llm_for()`, which is LRU-cached by (provider, SHA-256 of the key, model).
+Without these headers the server's own LLM is used. `RAG_ALLOW_CLIENT_LLM_KEYS=false`
+rejects them with 403.
 
 Error bodies have the shape `{"error": "<ErrorClass>", "detail": "<message>"}`. The
 mapping lives in one table (`interfaces/api.py::_STATUS_BY_ERROR`).
@@ -168,7 +180,19 @@ curl -X POST localhost:8000/collections/hr/query -H 'content-type: application/j
      -d '{"question": "How many days of annual leave do I get?"}'
 ```
 
-## 7. CLI
+## 7. Web UI (`rag_generator/ui/`)
+
+| Module | Responsibility |
+|--------|----------------|
+| `client.py` | `RAGClient`: typed HTTP client for every endpoint. It URL-encodes path segments, and turns error bodies into `APIError(message, status, error, retryable)`. An unreachable server gets a "start `rag serve`" hint. |
+| `formatting.py` | Pure helpers with no Streamlit import: status badges, `[S#]` → citation chips, escaping document text so Markdown and LaTeX in it render literally, and table rows for passages, ingest results, documents and metrics. |
+| `views.py` | **Ask** (chat with per-collection history; query options for mode, top-k, retrieval-only and corrective rewrite; answer with status badge, citation cards, passages table and trace), **Documents** (upload with types and limits from `/config`, ingest report, document table, delete, drop with confirmation), **Evaluate** (upload JSONL, pick modes and rerankers, metrics, best configuration, gate calibration, per-category table, JSON download), **System** (active models and defaults). |
+| `app.py` | Entry point: sidebar (API URL, connection status, collection picker and new-collection name validation) and tabs. |
+
+Dependency rule: `ui/` imports only `ui/`, `streamlit` and `httpx`, never the backend
+packages. Everything the UI knows about the server comes from `/config`.
+
+## 8. CLI
 
 | Command | Purpose |
 |---------|---------|
@@ -178,6 +202,7 @@ curl -X POST localhost:8000/collections/hr/query -H 'content-type: application/j
 | `rag delete DOC_ID [-c NAME]` / `rag drop [-c NAME] [--yes]` | Remove a document or a whole collection. |
 | `rag eval DATASET [-c NAME] [--modes dense,bm25,hybrid] [--rerankers none,cross_encoder] [--answers] [--judge]` | Evaluate. Writes a JSON report to `eval_reports/`. |
 | `rag serve [--host] [--port]` | Start the REST API. |
+| `rag ui [--api-url] [--port] [--host] [--with-api]` | Start the Streamlit UI (requires the `ui` extra). `--with-api` also starts `rag serve`. |
 
 Exit codes: `0` for success, `1` for an application error (the message goes to
 stderr), and `2` for invalid configuration.

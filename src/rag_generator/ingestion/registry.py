@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from rag_generator.errors import UnsupportedFileTypeError
 from rag_generator.ingestion.base import DocumentParser
-from rag_generator.ingestion.parsers import DocxParser, PdfParser, TextParser
+from rag_generator.ingestion.parsers import (
+    CsvParser,
+    DocxParser,
+    PdfParser,
+    PptxParser,
+    TextParser,
+    XlsxParser,
+)
 from rag_generator.models import ParsedDocument
 
 
 class ParserRegistry:
     def __init__(self, parsers: list[DocumentParser] | None = None) -> None:
         self._by_extension: dict[str, DocumentParser] = {}
-        for parser in parsers or [PdfParser(), TextParser(), DocxParser()]:
+        default = [PdfParser(), TextParser(), DocxParser(), CsvParser(), XlsxParser(), PptxParser()]
+        for parser in parsers or default:
             self.register(parser)
 
     def register(self, parser: DocumentParser) -> None:

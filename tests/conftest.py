@@ -129,6 +129,51 @@ def make_docx(paragraphs: list[str], table: list[list[str]] | None = None) -> by
     return buffer.getvalue()
 
 
+def make_xlsx(sheets: dict[str, list[list[Any]]]) -> bytes:
+    import openpyxl
+
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    for title, rows in sheets.items():
+        sheet = workbook.create_sheet(title)
+        for row in rows:
+            sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def make_pptx(
+    slides: list[list[str]],
+    notes: dict[int, str] | None = None,
+    table: list[list[str]] | None = None,
+) -> bytes:
+    """One slide per entry (each string a text box). ``notes`` maps 1-based slide number to
+    speaker notes; ``table`` is added to the last slide. An empty entry is a blank slide."""
+    import pptx
+    from pptx.util import Inches
+
+    presentation = pptx.Presentation()
+    blank = presentation.slide_layouts[6]
+    for number, texts in enumerate(slides, start=1):
+        slide = presentation.slides.add_slide(blank)
+        for i, text in enumerate(texts):
+            box = slide.shapes.add_textbox(Inches(1), Inches(1 + i), Inches(6), Inches(1))
+            box.text_frame.text = text
+        if notes and number in notes:
+            slide.notes_slide.notes_text_frame.text = notes[number]
+        if table and number == len(slides):
+            shape = slide.shapes.add_table(
+                len(table), len(table[0]), Inches(1), Inches(4), Inches(6), Inches(2)
+            )
+            for r, row in enumerate(table):
+                for c, value in enumerate(row):
+                    shape.table.cell(r, c).text = value
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
+
+
 def dump_jsonl(path: Path, rows: list[dict]) -> Path:
     path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     return path

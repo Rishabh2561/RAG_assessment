@@ -1,3 +1,9 @@
-from rag_generator.config.settings import RetrievalMode, Settings
+from rag_generator.config.settings import (
+    DEFAULT_LLM_MODELS,
+    LLMProviderName,
+    RetrievalMode,
+    Settings,
+    detect_provider,
+)
 
-__all__ = ["RetrievalMode", "Settings"]
+__all__ = ["DEFAULT_LLM_MODELS", "LLMProviderName", "RetrievalMode", "Settings", "detect_provider"]

@@ -1,7 +1,16 @@
 """IngestionService with real parsers/chunker/store and the hashing embedder."""
 
 from rag_generator.storage import NumpyVectorStore
-from tests.conftest import ALT_SAMPLE_DIR, SAMPLE_DIR, make_image_only_pdf, make_pdf
+from tests.conftest import (
+    ALT_SAMPLE_DIR,
+    SAMPLE_DIR,
+    FakeLLM,
+    cite_first_source,
+    make_image_only_pdf,
+    make_pdf,
+    make_pptx,
+    make_xlsx,
+)
 
 
 def test_ingest_sample_directory(make_app):
@@ -47,7 +56,7 @@ def test_bad_files_fail_individually_without_aborting_batch(make_app):
             ("empty.txt", b""),
             ("scan.pdf", make_image_only_pdf()),
             ("broken.pdf", b"%PDF-1.4 garbage"),
-            ("sheet.xlsx", b"PK..."),
+            ("sheet.xls", b"legacy binary workbook"),
             ("also_good.pdf", make_pdf(["A valid PDF page with enough text to index."])),
         ],
         "c",
@@ -58,7 +67,7 @@ def test_bad_files_fail_individually_without_aborting_batch(make_app):
     assert status["empty.txt"] == ("failed", "EmptyDocumentError")
     assert status["scan.pdf"] == ("failed", "OCRRequiredError")
     assert status["broken.pdf"] == ("failed", "CorruptDocumentError")
-    assert status["sheet.xlsx"] == ("failed", "UnsupportedFileTypeError")
+    assert status["sheet.xls"] == ("failed", "UnsupportedFileTypeError")
     assert len(app.repository.open("c").catalog) == 2
 
 
@@ -108,3 +117,24 @@ def test_embedding_model_change_is_detected(make_app, settings):
     assert isinstance(collection.store, NumpyVectorStore)
     report = other.ingestion().ingest_bytes([("new.txt", b"Some brand new content here.")], "c")
     assert report.results[0].error_type == "IndexMismatchError"
+
+
+def test_tabular_and_slide_formats_are_ingested_and_citable(make_app):
+    app = make_app()
+    report = app.ingestion().ingest_bytes(
+        [
+            ("prices.csv", b"SKU,Price\nNW-200,4999\nNW-C2,349\n"),
+            ("stock.xlsx", make_xlsx({"Stock": [["SKU", "Warehouse"], ["NW-C2", "Leeds"]]})),
+            ("deck.pptx", make_pptx([["Intro slide text here"], ["The NW-C2 ships in Q4."]])),
+        ],
+        "c",
+    )
+    assert [r.status for r in report.results] == ["ingested"] * 3
+    chunks = {c.source: c for c in app.repository.open("c").store.all_chunks()}
+    assert chunks["prices.csv"].text.startswith("Row 2: SKU: NW-200 | Price: 4999")
+    assert chunks["stock.xlsx"].text == "[Stock] Row 2: SKU: NW-C2 | Warehouse: Leeds"
+
+    answer = make_app(llm=FakeLLM(cite_first_source)).query("c").ask("Which warehouse is NW-C2 in?")
+    assert answer.citations
+    deck = [p.chunk for p in answer.passages if p.chunk.source == "deck.pptx"]
+    assert all(c.page in (1, 2) for c in deck)

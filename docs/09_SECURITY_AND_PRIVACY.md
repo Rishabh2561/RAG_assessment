@@ -32,6 +32,23 @@ request ends. The application itself writes no temporary files.
   without being exported.
 - The key isn't needed for ingestion, retrieval or tests.
 
+### Keys entered in the UI
+
+- They are held in the Streamlit session (server-side memory of the UI process) and
+  sent to the API as the `X-LLM-API-Key` header on answer requests only. They are not
+  put in URLs, not written to disk, and not echoed back: the sidebar shows a masked
+  preview (`sk-ant-…9999`).
+- The API uses the key only to build the provider object for the request (cached in
+  memory by SHA-256 of the key). It never logs it or returns it. A test sends a key
+  through `/query`, `/config`, `/health` and `/llm/verify` and asserts it appears in no
+  response and no log record. A manual run confirmed the key is absent from the
+  server's console log.
+- **The UI and API talk plain HTTP.** That's fine on `127.0.0.1` (the default for
+  both). If you put them on different machines, add TLS (a reverse proxy) or the key
+  travels in clear text.
+- On a shared server where users must not bring their own keys, set
+  `RAG_ALLOW_CLIENT_LLM_KEYS=false`.
+
 ## 3. Logging
 
 - Document text and questions are **redacted by default**. The only path for content
@@ -65,9 +82,9 @@ citations let the user see which document the claim came from.
 |--------|---------|
 | Oversized files and memory exhaustion | `RAG_MAX_FILE_MB` (50 MB). The API reads at most limit + 1 bytes per file and at most `RAG_MAX_UPLOAD_FILES` (20) files per request |
 | Path traversal via file names | Upload names are reduced to their base name (`../../etc/x.txt` → `x.txt`, tested). Collection names must match `^[A-Za-z0-9_-]{1,64}$` because they become directory names |
-| Malformed PDF or DOCX exploiting a parser | PyMuPDF and python-docx are mature, maintained libraries. Parse errors are caught per file. There's no sandboxing (see §7) |
-| Zip bombs (DOCX is a zip) | python-docx reads only the parts it needs. There's no explicit decompression limit (a residual risk) |
-| Executable content (macros, JavaScript in PDFs) | Never executed: we extract text only |
+| Malformed PDF or Office file exploiting a parser | PyMuPDF, python-docx, python-pptx and openpyxl are mature, maintained libraries. Parse errors are caught per file. There's no sandboxing (see §7) |
+| Zip bombs (DOCX, PPTX and XLSX are zips) | The libraries read only the parts they need; openpyxl streams sheets in read-only mode. There's no explicit decompression limit (a residual risk) |
+| Executable content (macros in `.xlsm`, JavaScript in PDFs) | Never executed: we extract text only |
 | Pickle deserialisation | The index is loaded with `np.load(allow_pickle=False)`, and chunks are stored as JSON |
 
 ## 6. Tenant and document isolation
@@ -75,6 +92,11 @@ citations let the user see which document the claim came from.
 - Collections are separate directories and separate in-memory handles. A query can
   only retrieve from the collection it names, so documents from different sets are
   never mixed in one answer (tested: `test_collections_are_isolated_and_persist`).
+- **The Streamlit UI (`rag ui`) has the same exposure:** it can upload, delete and drop
+  collections. It binds to `127.0.0.1` by default (Streamlit itself would listen on
+  all interfaces). It holds no secrets: API keys live only on the API server, and
+  `/config` never returns them (tested). Document text shown in the UI is escaped, so
+  Markdown or LaTeX inside a document can't alter the page.
 - **There is no authentication or authorisation.** Anyone who can reach the API can
   read and delete every collection. By default `rag serve` binds to `127.0.0.1`.
   Don't expose it on a network as it is.

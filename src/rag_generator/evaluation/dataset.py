@@ -42,16 +42,23 @@ class EvalItem(BaseModel):
 
 
 def load_dataset(path: Path) -> list[EvalItem]:
+    return parse_dataset(path.read_text(encoding="utf-8"), origin=str(path))
+
+
+def parse_dataset(text: str, origin: str = "dataset") -> list[EvalItem]:
+    """Parse JSONL eval items; ``origin`` names the source in error messages."""
     items = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             items.append(EvalItem.model_validate(json.loads(line)))
         except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(f"{path}:{line_no}: invalid eval item ({exc})") from exc
+            raise ValueError(f"{origin}:{line_no}: invalid eval item ({exc})") from exc
+    if not items:
+        raise ValueError(f"{origin}: no evaluation items found")
     ids = [i.id for i in items]
     if len(ids) != len(set(ids)):
-        raise ValueError(f"{path}: duplicate item ids")
+        raise ValueError(f"{origin}: duplicate item ids")
     return items

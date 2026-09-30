@@ -225,3 +225,100 @@ and *why* things were decided or changed.
   the per-provider defaults apply.
 - **Impact:** 34 new tests (181 offline tests in total). ADR-014. Docs 00, 03, 05, 07, 08
   and 09 updated. `/health` reports `llm_provider`.
+
+### 2026-09-30 — D15: PowerPoint, Excel and CSV ingestion
+- **Context:** Extension request: ingest PDF, Excel, CSV and PowerPoint files (PDF was
+  already supported).
+- **Options:** One generic library (Unstructured) vs one small parser per format;
+  spreadsheets as one text blob, as Markdown tables, or as one line per row.
+- **Decision:** `PptxParser` (python-pptx), `XlsxParser` (openpyxl) and `CsvParser`
+  (stdlib), registered by default. Slides map to pages. Each spreadsheet row becomes
+  `[Sheet] Row N: Header: value | …`.
+- **Reason:** The registry made this additive. Repeating header names per row keeps a
+  chunk cut from the middle of a table interpretable and matches the chunker's newline
+  boundaries; Markdown tables lose their header after the first chunk.
+- **Trade-offs:**
+  1. Row lines are verbose, so wide tables use more embedding tokens per row.
+  2. Formula cells show Excel's last-saved value; files never calculated by Excel read
+     as empty there.
+  3. Legacy `.xls` / `.ppt`, charts and images inside slides are not extracted.
+- **Impact:** Two new runtime dependencies (`openpyxl`, `python-pptx`). 11 new tests.
+  README and docs 00, 01, 02, 05, 07, 08 and 09 updated.
+
+### 2026-09-30 — D15: Streamlit web UI over the REST API (revises ADR-012)
+- **Context:** A UI was requested, using the tool named in ADR-012's alternatives. The
+  user chose Streamlit talking to the existing REST API, over Streamlit in-process or
+  Gradio.
+- **Decision:** A new `rag_generator/ui/` package that is a **pure HTTP client**. It has
+  Ask, Documents, Evaluate and System views, and is launched with `rag ui`
+  (`--with-api` also starts the server). `streamlit` is an optional `ui` extra.
+- **API additions needed by the UI:** `GET /config` (so the UI hard-codes no formats,
+  limits, modes or defaults), `POST /collections/{c}/evaluate`, and a per-request
+  `rewrite` flag. The evaluation report builder moved into a shared `run_evaluation()`,
+  which removed duplicated logic between the CLI and the API. It also validates
+  mode and reranker names: the CLI previously fell back silently to hybrid on a typo.
+- **Found while building it:**
+  1. `/health` and `/config` reported `llm_provider: "none"` when an LLM was injected
+     without matching settings, which disabled the UI's answer mode. The provider is
+     now derived from the LLM actually in use.
+  2. Evaluation reports could contain NaN, which is invalid JSON. They are now
+     normalised to `null`.
+  3. Streamlit binds to all network interfaces by default. `rag ui` binds to
+     127.0.0.1, because the UI can delete data and has no auth.
+  4. A credentials error pointed browser users to a CLI flag. The UI now points to its
+     own "Retrieval only" toggle.
+- **Verification:** 33 new tests, including Streamlit `AppTest` runs through real HTTP
+  into the real API (225 offline tests in total). A manual smoke test was run against
+  a live `rag serve` with the real bge-small model and the sample corpus: the
+  retrieval-only answer returned ranked passages, the no-key answer path showed the
+  credentials message, and the Streamlit server returned HTTP 200.
+- **Trade-off:** Two processes instead of one; `--with-api` hides this for local use.
+
+### 2026-09-30 — D16: Use whichever API key is entered (UI key entry and `RAG_LLM_PROVIDER=auto`)
+- **Context:** Requested: let the user enter an Anthropic or OpenAI API key, and have the
+  application use whichever one was entered.
+- **Options:**
+  1. A "set key" endpoint that swaps the server's LLM globally.
+  2. **Request-scoped keys**: the UI sends the key with each request, and the server
+     builds that provider for the request.
+  3. Writing the key into `.env` from the UI.
+- **Decision:** Option 2, plus auto-detection:
+  - `sk-ant-…` means Anthropic; any other `sk-…` means OpenAI. A provider selector
+    overrides the guess.
+  - New headers `X-LLM-API-Key`, `X-LLM-Provider` and `X-LLM-Model` on `/query`,
+    `/evaluate` and `/llm/verify`.
+  - The same rule applies to server configuration: the new default
+    `RAG_LLM_PROVIDER=auto` uses whichever of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is
+    set (Anthropic first), and falls back to retrieval-only if neither is set.
+- **Reason:** Option 1 makes one user's key everyone's, and adds shared mutable state and
+  races. Option 3 persists secrets from a web form. With option 2, keys live only in the
+  user's session, and the server stays stateless about credentials.
+- **Trade-offs:**
+  - The key crosses the UI→API hop on every request. That's plain HTTP, acceptable on
+    localhost only; put TLS in front for remote use (09_SECURITY).
+  - `auto` only sees keys in the environment or `.env`. Anthropic credentials from an
+    `ant auth login` profile need an explicit `RAG_LLM_PROVIDER=anthropic`.
+  - With no key, the default moved from "anthropic, then an error on first question"
+    to "retrieval-only", which is friendlier. The explicit error path (D13) still applies
+    when a provider is forced.
+  - `RAG_ALLOW_CLIENT_LLM_KEYS=false` disables client keys for shared deployments.
+- **Bugs caught while building it:**
+  - My settings edit accidentally moved `collections_dir` out of the `Settings` class,
+    and every API test failed. It was fixed immediately.
+  - FastAPI couldn't resolve a dependency alias defined inside `create_app` (because of
+    postponed annotations), so it silently treated the dependency as a query parameter
+    and every query returned 422. The dependency now lives at module level.
+- **Verification:**
+  - 34 new tests (259 offline tests in total), covering detection, override, bad headers,
+    the disable switch, caching, `/llm/verify`, evaluation with a client key, and the key
+    absent from every response and log. The UI tests enter a key in the sidebar and get a
+    cited answer through the real API.
+  - A **real-SDK smoke test**: deliberately invalid Anthropic and OpenAI keys entered in
+    the UI were each routed to the right vendor, rejected by that vendor's real API, and
+    reported in the UI. The server log contained the key zero times.
+- **Found by the final check (a latent bug since D14):** `.env.example` had
+  `ANTHROPIC_API_KEY=   # comment`, and python-dotenv parses that as the value
+  `"# comment"`. Under `auto`, anyone copying the example would have silently selected
+  Anthropic with a bogus key. Fixed twice over: the comments now sit on their own lines,
+  and `Settings` treats blank or `#…` key values as unset. There are regression tests for
+  both, including one that loads the real `.env.example`.

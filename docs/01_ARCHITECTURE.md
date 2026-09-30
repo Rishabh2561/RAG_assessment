@@ -30,6 +30,9 @@ flowchart LR
         PR[ParserRegistry] --> P1[PdfParser<br/>PyMuPDF]
         PR --> P2[TextParser<br/>txt / md]
         PR --> P3[DocxParser]
+        PR --> P4[PptxParser]
+        PR --> P5[XlsxParser]
+        PR --> P6[CsvParser<br/>csv / tsv]
         CH[RecursiveChunker]
     end
 
@@ -74,7 +77,7 @@ flowchart LR
 | Component | Responsibility | Default implementation | Swappable via |
 |-----------|----------------|------------------------|---------------|
 | `Settings` | Single typed source of configuration: env vars with the `RAG_` prefix plus an optional `.env`. Validated at start-up. | `pydantic-settings` | — |
-| `ParserRegistry` / `DocumentParser` | Map a file extension to a parser. Produce a `ParsedDocument` made of ordered `Section`s, each with an optional page number. Detect empty, corrupt and scanned files. | `PdfParser` (PyMuPDF), `TextParser`, `DocxParser` | Register another parser |
+| `ParserRegistry` / `DocumentParser` | Map a file extension to a parser. Produce a `ParsedDocument` made of ordered `Section`s, each with an optional page number. Detect empty, corrupt and scanned files. | `PdfParser` (PyMuPDF), `TextParser`, `DocxParser`, `PptxParser`, `XlsxParser`, `CsvParser` | Register another parser |
 | `RecursiveChunker` | Split each section into overlapping chunks, preferring paragraph → line → sentence → word boundaries. Chunks never cross page boundaries, so page citations stay exact. | 700 characters, 140 overlap | `RAG_CHUNK_SIZE`, `RAG_CHUNK_OVERLAP` |
 | `EmbeddingProvider` | Text → L2-normalised vectors. Separate `embed_documents` and `embed_query` methods (some models use different prefixes). | `FastEmbedProvider` (`BAAI/bge-small-en-v1.5`, local ONNX) | `RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL` |
 | `VectorStore` | Persist chunks and vectors per collection; exact cosine search; delete by document. Records the embedding model and dimension, and refuses mismatched queries. | `NumpyVectorStore` (`.npy` + `.jsonl`) | `RAG_VECTOR_STORE` |

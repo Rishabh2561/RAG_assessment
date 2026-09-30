@@ -25,6 +25,17 @@ packages.
 - `.txt` and `.md` → `TextParser`, with UTF-8 decoding and a latin-1 fallback.
 - `.docx` → `DocxParser`, built on `python-docx`: paragraphs, then tables flattened to
   text.
+- `.pptx` → `PptxParser`, built on `python-pptx`: one section per slide, with the slide
+  number used as the page. Text boxes, grouped shapes, tables and speaker notes.
+- `.xlsx` / `.xlsm` → `XlsxParser`, built on `openpyxl` (read-only, cached formula
+  values): one section per non-empty sheet.
+- `.csv` / `.tsv` → `CsvParser` (stdlib `csv`, delimiter sniffed).
+
+Spreadsheet rows are flattened to one self-describing line each,
+`[Sheet] Row 7: Region: West | Revenue: 1200`, so any chunk cut from a long table
+still carries its column names and the row can be found in the source file. Legacy
+binary `.xls` and `.ppt` are not supported (they would need `xlrd` or a LibreOffice
+conversion).
 
 A PDF whose pages yield almost no text is classified as *probably scanned* and
 rejected with `OCRRequiredError`, not indexed as empty.
@@ -482,9 +493,10 @@ have about 25 settings, so flat is fine.
 
 ---
 
-## ADR-012 — Interfaces: CLI + REST API, no custom UI
+## ADR-012 — Interfaces: CLI + REST API, plus a Streamlit UI over the API
 
-**Status:** Accepted
+**Status:** Revised. The original decision was CLI + REST API with no custom UI. A
+Streamlit UI was added on request (DECISION_LOG D15); see "Revision" below.
 
 **Context.** Users must supply documents at runtime and ask questions. Evaluators need
 a fast way to try the system.
@@ -501,6 +513,25 @@ browser-based file upload and querying with no front-end code.
 **Trade-offs.** Less polished UX than a dedicated UI, but a much smaller surface area.
 Both interfaces are thin adapters over the same services, so adding a UI later is
 additive.
+
+**Revision: Streamlit UI (`rag ui`).** The UI is a **pure HTTP client** of the REST
+API. It imports no backend code: `rag_generator/ui/client.py` is its only way in.
+- *Why over REST rather than in-process:* one backend process serves the CLI, Swagger,
+  the UI and any other client. The UI can run on another machine. And the API
+  contract (`/config`, `/evaluate`, the error bodies) is exercised by a real client.
+- *What it cost:* three API additions, useful beyond the UI:
+  - `GET /config`: supported file types, limits, active models and defaults, so the
+    UI hard-codes none of them.
+  - `POST /collections/{c}/evaluate`: the evaluation harness over HTTP.
+  - A per-request `rewrite` flag on `/query`.
+  - Also, the CLI and API now share one `run_evaluation()` instead of duplicating it.
+- *Alternatives:*
+  - Streamlit in-process: one process, but it couples the UI to the backend's Python
+    environment and models.
+  - Gradio: similar, with less layout control for the evaluation dashboard.
+  - A React SPA: the most polished, but a second toolchain.
+- *Trade-off accepted:* two processes to run. `rag ui --with-api` starts both.
+  Like the API, the UI has **no authentication**, so it binds to 127.0.0.1 by default.
 
 ---
 

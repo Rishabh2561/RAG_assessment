@@ -14,12 +14,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 RetrievalMode = Literal["dense", "bm25", "hybrid"]
 
 DEFAULT_LLM_MODELS = {"anthropic": "claude-opus-5-5", "openai": "gpt-5.5"}
+LLMProviderName = Literal["anthropic", "openai"]
 DEFAULT_EMBEDDING_MODELS = {
     "fastembed": "BAAI/bge-small-en-v1.5",
     "openai": "text-embedding-3-small",
@@ -75,7 +76,8 @@ class Settings(BaseSettings):
     reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
 
     # Generation
-    llm_provider: Literal["anthropic", "openai", "none"] = "anthropic"
+    # auto -> whichever API key is configured (Anthropic first), else none (retrieval only)
+    llm_provider: Literal["auto", "anthropic", "openai", "none"] = "auto"
     llm_model: str | None = None  # None -> DEFAULT_LLM_MODELS[provider]
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "low"  # Anthropic
     llm_max_tokens: int = Field(4096, ge=256)
@@ -95,6 +97,8 @@ class Settings(BaseSettings):
     openai_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = (
         None
     )
+    # Let API clients (e.g. the web UI) supply their own provider + key per request.
+    allow_client_llm_keys: bool = True
     max_context_chars: int = Field(12000, ge=1000)
     max_question_chars: int = Field(2000, ge=10)
 
@@ -108,6 +112,17 @@ class Settings(BaseSettings):
     log_content: bool = False
 
     _gate_uncalibrated: bool = PrivateAttr(default=False)
+    _llm_provider_auto: bool = PrivateAttr(default=False)
+
+    @field_validator("anthropic_api_key", "openai_api_key", mode="after")
+    @classmethod
+    def _blank_key_is_unset(cls, value: SecretStr | None) -> SecretStr | None:
+        """Treat blank values, and ``KEY=  # comment`` lines (which dotenv parses as the
+        comment text), as no key, so a malformed .env can't select a provider."""
+        if value is None:
+            return None
+        secret = value.get_secret_value().strip()
+        return SecretStr(secret) if secret and not secret.startswith("#") else None
 
     @model_validator(mode="after")
     def _check_cross_field_constraints(self) -> Settings:
@@ -125,6 +140,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_provider_defaults(self) -> Settings:
+        if self.llm_provider == "auto":
+            self.llm_provider = _provider_from_keys(self.anthropic_api_key, self.openai_api_key)
+            self._llm_provider_auto = True
         if self.llm_model is None and self.llm_provider in DEFAULT_LLM_MODELS:
             self.llm_model = DEFAULT_LLM_MODELS[self.llm_provider]
         if self.embedding_model is None:
@@ -142,5 +160,32 @@ class Settings(BaseSettings):
         return self._gate_uncalibrated
 
     @property
+    def llm_provider_auto(self) -> bool:
+        """True when ``llm_provider`` was chosen from the configured keys (auto mode)."""
+        return self._llm_provider_auto
+
+    def api_key_for(self, provider: str) -> SecretStr | None:
+        return {"anthropic": self.anthropic_api_key, "openai": self.openai_api_key}.get(provider)
+
+    @property
     def collections_dir(self) -> Path:
         return self.data_dir / "collections"
+
+
+def detect_provider(api_key: str) -> LLMProviderName | None:
+    """Guess the vendor from a key's format: Anthropic keys start with ``sk-ant-``;
+    OpenAI keys start with ``sk-`` (``sk-proj-``, ``sk-svcacct-``, legacy ``sk-``)."""
+    key = api_key.strip()
+    if key.startswith("sk-ant-"):
+        return "anthropic"
+    if key.startswith("sk-"):
+        return "openai"
+    return None
+
+
+def _provider_from_keys(anthropic: SecretStr | None, openai: SecretStr | None) -> str:
+    if anthropic is not None and anthropic.get_secret_value().strip():
+        return "anthropic"
+    if openai is not None and openai.get_secret_value().strip():
+        return "openai"
+    return "none"
